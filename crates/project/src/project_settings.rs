@@ -626,6 +626,10 @@ pub struct InlineDiagnosticsSettings {
     pub min_column: u32,
 
     pub max_severity: Option<DiagnosticSeverity>,
+
+    /// Whether to tint the background of lines containing a diagnostic with a
+    /// faint severity color (Error Lens style).
+    pub highlight_line: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -754,6 +758,7 @@ impl Settings for ProjectSettings {
                     padding: inline_diagnostics.padding.unwrap(),
                     min_column: inline_diagnostics.min_column.unwrap(),
                     max_severity: inline_diagnostics.max_severity.map(Into::into),
+                    highlight_line: inline_diagnostics.highlight_line.unwrap(),
                 },
             },
             git: git_settings,

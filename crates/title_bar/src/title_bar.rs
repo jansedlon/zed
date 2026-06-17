@@ -412,7 +412,8 @@ impl Render for TitleBar {
                     h_flex()
                         .bg(title_bar_color)
                         .h(height)
-                        .pl_2()
+                        .px_3()
+                        .gap_2()
                         .justify_between()
                         .w_full()
                         .children(children),

@@ -2281,12 +2281,32 @@ impl LspCommand for GetCompletions {
         &self,
         path: &Path,
         _: &Buffer,
-        _: &Arc<LanguageServer>,
+        language_server: &Arc<LanguageServer>,
         _: &App,
     ) -> Result<lsp::CompletionParams> {
+        // Completion trigger characters are merged across all of a buffer's
+        // language servers, so a character advertised by one server (e.g. a
+        // letter registered by Emmet/Tailwind) can reach another server as a
+        // trigger character it never advertised. Only forward the trigger
+        // character to a server that actually registered it; otherwise fall
+        // back to an `Invoked` request. Some servers (e.g. tsgo) panic on a
+        // trigger character they don't recognize.
+        let mut context = self.context.clone();
+        let server_advertised_trigger = context.trigger_character.as_deref().is_some_and(|trigger| {
+            language_server
+                .capabilities()
+                .completion_provider
+                .as_ref()
+                .and_then(|provider| provider.trigger_characters.as_ref())
+                .is_some_and(|triggers| triggers.iter().any(|known| known == trigger))
+        });
+        if context.trigger_character.is_some() && !server_advertised_trigger {
+            context.trigger_kind = CompletionTriggerKind::INVOKED;
+            context.trigger_character = None;
+        }
         Ok(lsp::CompletionParams {
             text_document_position: make_lsp_text_document_position(path, self.position)?,
-            context: Some(self.context.clone()),
+            context: Some(context),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         })

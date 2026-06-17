@@ -1350,7 +1350,15 @@ impl CodeLabelExt for CodeLabel {
         let runs = highlight_id
             .map(|highlight_id| vec![(0..label_length, highlight_id)])
             .unwrap_or_default();
-        let text = if let Some(detail) = item.detail.as_deref().filter(|detail| detail != label) {
+        let text = if is_typescript_family(language) {
+            // TypeScript servers pack the type signature into `detail`, which
+            // crowds the row; show only the import module specifier (like VS
+            // Code) and surface the signature in the documentation aside.
+            match typescript_completion_module(item) {
+                Some(module) => format!("{label} {module}"),
+                None => label.clone(),
+            }
+        } else if let Some(detail) = item.detail.as_deref().filter(|detail| detail != label) {
             format!("{label} {detail}")
         } else if let Some(description) = item
             .label_details
@@ -1373,6 +1381,114 @@ impl CodeLabelExt for CodeLabel {
             filter_range,
         }
     }
+}
+
+/// Whether `language` is a TypeScript-family language (TypeScript, TSX,
+/// JavaScript, JSX).
+///
+/// These language servers — typescript-language-server, vtsls, and the tsgo
+/// extension — pack the import module specifier and the type signature into the
+/// completion's `detail`/`label_details`. Zed shows only the module on the
+/// completion row (like VS Code) and moves the signature to the documentation
+/// aside (see [`completion_aside_detail`]). Keying this on the buffer language
+/// rather than the LSP adapter means it applies to every TypeScript server,
+/// including extension-provided ones that go through
+/// [`CodeLabel::fallback_for_completion`].
+fn is_typescript_family(language: Option<&Language>) -> bool {
+    let Some(language) = language else {
+        return false;
+    };
+    matches!(
+        language.name().as_ref(),
+        "TypeScript" | "TSX" | "JavaScript" | "JSX"
+    )
+}
+
+/// The type signature to show in a TypeScript completion's documentation aside,
+/// or `None` for non-TypeScript languages and completions without a signature.
+pub fn completion_aside_detail(
+    item: &lsp::CompletionItem,
+    language: Option<&Language>,
+) -> Option<String> {
+    if !is_typescript_family(language) {
+        return None;
+    }
+    typescript_completion_parts(item).signature
+}
+
+struct TypeScriptCompletionParts {
+    module: Option<String>,
+    signature: Option<String>,
+}
+
+fn typescript_completion_module(item: &lsp::CompletionItem) -> Option<String> {
+    typescript_completion_parts(item).module
+}
+
+/// Splits a TypeScript completion into its import module specifier (shown on the
+/// row, like VS Code) and its type signature (shown in the documentation aside).
+///
+/// The servers expose this differently:
+/// - vtsls and tsgo put the module specifier in `label_details.description`.
+/// - typescript-language-server's unresolved `detail` is the bare module
+///   specifier; after resolve it becomes `"Add import from '<module>'\n<signature>"`
+///   (the verb is "Add" or "Auto" depending on the bundled tsserver).
+/// - In-scope symbols have no module; their `detail` is the plain signature.
+fn typescript_completion_parts(item: &lsp::CompletionItem) -> TypeScriptCompletionParts {
+    let mut module = item
+        .label_details
+        .as_ref()
+        .and_then(|details| details.description.as_deref())
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_owned);
+    let mut signature = None;
+
+    if let Some(detail) = item
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        if let Some((import_module, import_signature)) = parse_auto_import_detail(detail) {
+            if module.is_none() {
+                module = Some(import_module.to_owned());
+            }
+            signature = import_signature.map(str::to_owned);
+        } else if is_module_specifier(detail) {
+            // Unresolved auto-import from typescript-language-server: the bare
+            // module specifier. In-scope symbols never carry an unresolved
+            // `detail`, so a whitespace-free `detail` here is always a module.
+            if module.is_none() {
+                module = Some(detail.to_owned());
+            }
+        } else {
+            signature = Some(detail.to_owned());
+        }
+    }
+
+    TypeScriptCompletionParts { module, signature }
+}
+
+/// Parses the `"Add import from '<module>'\n<signature>"` detail emitted for
+/// resolved auto-import completions into its module specifier and trailing
+/// signature.
+fn parse_auto_import_detail(detail: &str) -> Option<(&str, Option<&str>)> {
+    let first_line = detail.lines().next()?;
+    let quoted_module = first_line.split_once("import from ")?.1.trim();
+    let module = quoted_module.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+    if module.is_empty() {
+        return None;
+    }
+    let signature = detail[first_line.len()..].trim();
+    let signature = (!signature.is_empty()).then_some(signature);
+    Some((module, signature))
+}
+
+/// A module specifier (`./foo`, `@scope/pkg`, `lodash`) never contains
+/// whitespace, whereas a TypeScript type signature always does.
+fn is_module_specifier(detail: &str) -> bool {
+    !detail.contains(char::is_whitespace)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1643,6 +1759,128 @@ pub fn markdown_lang() -> Arc<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_typescript_completion_parts() {
+        let parts = |item: &lsp::CompletionItem| {
+            let parts = typescript_completion_parts(item);
+            (parts.module, parts.signature)
+        };
+
+        // typescript-language-server: an unresolved auto-import carries the bare
+        // module specifier in `detail`.
+        assert_eq!(
+            parts(&lsp::CompletionItem {
+                label: "analyticsDb".into(),
+                detail: Some("./exports".into()),
+                ..Default::default()
+            }),
+            (Some("./exports".to_owned()), None),
+        );
+
+        // typescript-language-server: a resolved auto-import packs the import
+        // prose and the type signature into `detail`.
+        assert_eq!(
+            parts(&lsp::CompletionItem {
+                label: "analyticsDb".into(),
+                detail: Some("Auto import from './exports'\nconst analyticsDb: 123".into()),
+                ..Default::default()
+            }),
+            (
+                Some("./exports".to_owned()),
+                Some("const analyticsDb: 123".to_owned())
+            ),
+        );
+
+        // vtsls / tsgo: the module lives in `label_details.description`; the
+        // resolved `detail` uses double quotes and a blank line before the body.
+        assert_eq!(
+            parts(&lsp::CompletionItem {
+                label: "AnalyticsConfig".into(),
+                detail: Some(
+                    "Add import from \"facebook-nodejs-business-sdk\"\n\ninterface AnalyticsConfig"
+                        .into()
+                ),
+                label_details: Some(lsp::CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some("facebook-nodejs-business-sdk".into()),
+                }),
+                ..Default::default()
+            }),
+            (
+                Some("facebook-nodejs-business-sdk".to_owned()),
+                Some("interface AnalyticsConfig".to_owned()),
+            ),
+        );
+
+        // In-scope alias (from the reported screenshot): a signature, no module.
+        assert_eq!(
+            parts(&lsp::CompletionItem {
+                label: "analyticsDb".into(),
+                detail: Some("(alias) const analyticsDb: NodePgDatabase<{}>".into()),
+                ..Default::default()
+            }),
+            (
+                None,
+                Some("(alias) const analyticsDb: NodePgDatabase<{}>".to_owned())
+            ),
+        );
+
+        // Nothing to add when the server provides neither detail nor label details.
+        assert_eq!(
+            parts(&lsp::CompletionItem {
+                label: "foo".into(),
+                ..Default::default()
+            }),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn test_typescript_completion_label_and_aside() {
+        let typescript = Language::new(
+            LanguageConfig {
+                name: "TypeScript".into(),
+                ..LanguageConfig::default()
+            },
+            None,
+        );
+
+        // Auto-import row shows only the module; the signature is left for the aside.
+        let item = lsp::CompletionItem {
+            label: "AnalyticsConfig".into(),
+            kind: Some(lsp::CompletionItemKind::INTERFACE),
+            detail: Some(
+                "Add import from \"facebook-nodejs-business-sdk\"\n\ninterface AnalyticsConfig"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let label = CodeLabel::fallback_for_completion(&item, Some(&typescript));
+        assert_eq!(label.text, "AnalyticsConfig facebook-nodejs-business-sdk");
+        assert_eq!(label.filter_text(), "AnalyticsConfig");
+        assert_eq!(
+            completion_aside_detail(&item, Some(&typescript)).as_deref(),
+            Some("interface AnalyticsConfig"),
+        );
+
+        // In-scope symbol: the row is just the name; the signature goes to the aside.
+        let item = lsp::CompletionItem {
+            label: "localVariable".into(),
+            kind: Some(lsp::CompletionItemKind::VARIABLE),
+            detail: Some("const localVariable: 42".into()),
+            ..Default::default()
+        };
+        let label = CodeLabel::fallback_for_completion(&item, Some(&typescript));
+        assert_eq!(label.text, "localVariable");
+        assert_eq!(
+            completion_aside_detail(&item, Some(&typescript)).as_deref(),
+            Some("const localVariable: 42"),
+        );
+
+        // Non-TypeScript completions are unaffected: no aside detail is produced.
+        assert_eq!(completion_aside_detail(&item, None), None);
+    }
     use gpui::{TestAppContext, rgba};
     use pretty_assertions::assert_matches;
 

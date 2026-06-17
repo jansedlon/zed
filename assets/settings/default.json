@@ -228,6 +228,17 @@
   "use_system_prompts": true,
   // Whether the cursor blinks in the editor.
   "cursor_blink": true,
+  // Whether to smoothly animate the cursor to its new position when it moves,
+  // instead of jumping instantly.
+  "cursor_smooth_caret_animation": false,
+  // Whether the cursor fades in and out smoothly when blinking, instead of
+  // toggling on/off abruptly. Has no effect when "cursor_blink" is off.
+  "cursor_smooth_blink": false,
+  // Whether the selection highlight glides to follow the caret as you select,
+  // instead of snapping. Best paired with "cursor_smooth_caret_animation".
+  "cursor_smooth_selection": false,
+  // Whether newly typed (or pasted) text fades in instead of appearing instantly.
+  "smooth_typing": false,
   // Cursor shape for the default editor.
   //  1. A vertical bar
   //     "bar"
@@ -333,6 +344,16 @@
   // 2. Display a single-letter badge, colorized based on the active syntax theme:
   //   "symbol"
   "completion_menu_item_kind": "off",
+  // Whether to pre-select the most recently accepted matching completion when the
+  // completion menu opens, instead of always selecting the top-ranked one
+  // (matching VS Code's "editor.suggestSelection": "recentlyUsed").
+  "completion_recency": false,
+  // Whether to rank completions whose identifier appears near the cursor higher
+  // (matching VS Code's "editor.suggest.localityBonus").
+  "completion_locality": false,
+  // Font family for the inline diagnostic (Error Lens) message. When null, the
+  // UI font is used.
+  "inline_diagnostic_font": null,
   // How to display diffs in the editor.
   //
   // Default: split
@@ -1556,6 +1577,9 @@
       // The minimum severity of the diagnostics to show inline.
       // Inherits editor's diagnostics' max severity settings when `null`.
       "max_severity": null,
+      // Tint the background of lines that contain a diagnostic with a faint
+      // severity color, like the "Error Lens" VS Code extension.
+      "highlight_line": false,
     },
   },
   // Files or globs of files that will be excluded by Zed entirely. They will be skipped during file
@@ -1843,6 +1867,10 @@
     //
     // Default: "block"
     "cursor_shape": "block",
+    // Whether the cursor glides smoothly to its new position while typing at the
+    // prompt, instead of jumping. Output, full-screen apps (vim, htop), and large
+    // jumps still move instantly.
+    "smooth_caret": false,
     // Set whether Alternate Scroll mode (code: ?1007) is active by default.
     // Alternate Scroll mode converts mouse scroll events into up / down key
     // presses when in the alternate screen (e.g. when running applications

@@ -1242,7 +1242,7 @@ impl Element for TerminalElement {
                         size: size(cursor_width.ceil(), dimensions.line_height),
                     });
 
-                let cursor = if let CursorShape::Hidden = cursor.shape {
+                let mut cursor = if let CursorShape::Hidden = cursor.shape {
                     None
                 } else {
                     let focused = self.focused;
@@ -1268,6 +1268,25 @@ impl Element for TerminalElement {
                         )
                     })
                 };
+
+                // Smoothly glide the cursor toward its target while typing at the
+                // prompt (Terminal::smooth_caret_origin decides when to animate vs snap).
+                if let Some(cursor) = cursor.as_mut()
+                    && let Some(bounds) = ime_cursor_bounds
+                {
+                    let smooth_caret_enabled = TerminalSettings::get_global(cx).smooth_caret;
+                    let (origin, request_frame) = self.terminal.update(cx, |terminal, _| {
+                        terminal.smooth_caret_origin(
+                            bounds.origin,
+                            dimensions.line_height,
+                            smooth_caret_enabled,
+                        )
+                    });
+                    cursor.set_origin(origin);
+                    if request_frame {
+                        window.request_animation_frame();
+                    }
+                }
 
                 let block_below_cursor_element = if let Some(block) = &self.block_below_cursor {
                     let terminal = self.terminal.read(cx);

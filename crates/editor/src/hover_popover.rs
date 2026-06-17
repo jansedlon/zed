@@ -1,6 +1,6 @@
 use crate::{
-    Anchor, AnchorRangeExt, DisplayPoint, DisplayRow, Editor, EditorSettings, EditorSnapshot,
-    GlobalDiagnosticRenderer, HighlightKey, Hover,
+    Anchor, AnchorRangeExt, CodeActionProvider, DisplayPoint, DisplayRow, Editor, EditorSettings,
+    EditorSnapshot, GlobalDiagnosticRenderer, HighlightKey, Hover, code_lens,
     display_map::{InlayOffset, ToDisplayPoint, is_invisible},
     editor_settings::EditorSettingsScrollbarProxy,
     hover_links::{InlayHighlight, RangeInEditor},
@@ -10,16 +10,16 @@ use crate::{
 use anyhow::Context as _;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
-    TextStyleRefinement, Window, canvas, div, px,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Resource,
+    ScrollHandle, SharedUri, Size, StatefulInteractiveElement, StyleRefinement, Styled, Subscription,
+    Task, TaskExt, TextStyleRefinement, Window, canvas, div, px,
 };
 use itertools::Itertools;
-use language::{DiagnosticEntry, Language, LanguageRegistry};
+use language::{Buffer, DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::{MultiBufferOffset, ToOffset, ToPoint};
-use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
+use project::{CodeAction, HoverBlock, HoverBlockKind, InlayHintLabelPart};
 use settings::Settings;
 use std::{
     borrow::Cow,
@@ -28,7 +28,7 @@ use std::{
 use std::{ops::Range, sync::Arc, time::Duration};
 use std::{path::PathBuf, rc::Rc};
 use theme_settings::ThemeSettings;
-use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
+use ui::{CopyButton, ListItem, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
 use workspace::{OpenOptions, OpenVisible, Workspace};
@@ -37,6 +37,116 @@ pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
 pub const MIN_POPOVER_LINE_HEIGHT: f32 = 4.;
 pub const POPOVER_RIGHT_OFFSET: Pixels = px(8.0);
 pub const HOVER_POPOVER_GAP: Pixels = px(10.);
+
+impl Editor {
+    /// Fetches quick-fix code actions for the diagnostic at `position` and, once
+    /// they arrive, attaches them to the diagnostic hover popover anchored at
+    /// `diagnostic_anchor` (if it is still the one being shown).
+    fn fetch_diagnostic_quick_fixes(
+        &mut self,
+        buffer: Entity<Buffer>,
+        position: text::Anchor,
+        diagnostic_anchor: Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.code_action_providers.is_empty() {
+            return;
+        }
+        let range = position..position;
+        let action_tasks = self
+            .code_action_providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.clone(),
+                    provider.code_actions(&buffer, range.clone(), window, cx),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let task = cx.spawn_in(window, async move |editor, cx| {
+            let mut fixes = Vec::new();
+            for (provider, action_task) in action_tasks {
+                let Ok(actions) = action_task.await else {
+                    continue;
+                };
+                for action in actions {
+                    let is_quick_fix = action
+                        .lsp_action
+                        .action_kind()
+                        .is_some_and(|kind| kind.as_str().starts_with("quickfix"));
+                    if is_quick_fix {
+                        fixes.push(DiagnosticQuickFix {
+                            title: action.lsp_action.title().to_string().into(),
+                            action,
+                            provider: provider.clone(),
+                            buffer: buffer.clone(),
+                        });
+                    }
+                }
+            }
+            editor
+                .update(cx, |editor, cx| {
+                    if let Some(popover) = editor.hover_state.diagnostic_popover.as_mut()
+                        && popover.anchor == diagnostic_anchor
+                    {
+                        popover.quick_fixes = fixes;
+                        cx.notify();
+                    }
+                })
+                .ok();
+        });
+        self.hover_state.quick_fix_task = Some(task);
+    }
+
+    /// Applies the quick fix at `index` from the current diagnostic popover, then
+    /// hides the hover.
+    fn apply_diagnostic_quick_fix(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
+        let Some((action, provider, buffer, title)) =
+            self.hover_state
+                .diagnostic_popover
+                .as_ref()
+                .and_then(|popover| {
+                    let fix = popover.quick_fixes.get(index)?;
+                    Some((
+                        fix.action.clone(),
+                        fix.provider.clone(),
+                        fix.buffer.clone(),
+                        fix.action.lsp_action.title().to_string(),
+                    ))
+                })
+        else {
+            return;
+        };
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+
+        if code_lens::try_handle_client_command(&action, self, &workspace, window, cx) {
+            hide_hover(self, cx);
+            return;
+        }
+
+        let apply = provider.apply_code_action(buffer, action, true, window, cx);
+        let workspace = workspace.downgrade();
+        cx.spawn_in(window, async move |editor, cx| {
+            let transaction = apply.await?;
+            Editor::open_project_transaction(&editor, workspace, transaction, title, cx).await
+        })
+        .detach_and_log_err(cx);
+
+        hide_hover(self, cx);
+    }
+}
 
 /// Bindable action which uses the most recent selection head to trigger a hover
 pub fn hover(editor: &mut Editor, _: &Hover, window: &mut Window, cx: &mut Context<Editor>) {
@@ -225,6 +335,7 @@ pub fn hover_at_inlay(
                     keyboard_grace: Rc::new(RefCell::new(false)),
                     anchor: None,
                     last_bounds: Rc::new(Cell::new(None)),
+                    allow_remote_images: false,
                     _subscription: subscription,
                 };
 
@@ -255,6 +366,7 @@ pub fn hide_hover(editor: &mut Editor, cx: &mut Context<Editor>) -> bool {
     editor.hover_state.info_task = None;
     editor.hover_state.hiding_delay_task = None;
     editor.hover_state.closest_mouse_distance = None;
+    editor.hover_state.quick_fix_task = None;
 
     editor.clear_background_highlights(HighlightKey::HoverState, cx);
 
@@ -429,14 +541,30 @@ fn show_hover(
                     anchor,
                     last_bounds: Rc::new(Cell::new(None)),
                     _subscription: subscription,
+                    quick_fixes: Vec::new(),
                 })
             } else {
                 None
             };
 
+            let has_diagnostic = diagnostic_popover.is_some();
             this.update(cx, |this, _| {
                 this.hover_state.diagnostic_popover = diagnostic_popover;
             })?;
+
+            // Fetch quick-fix code actions for the diagnostic in the background;
+            // the popover renders them as buttons once they arrive.
+            if has_diagnostic {
+                this.update_in(cx, |editor, window, cx| {
+                    editor.fetch_diagnostic_quick_fixes(
+                        buffer.clone(),
+                        buffer_position,
+                        anchor,
+                        window,
+                        cx,
+                    );
+                })?;
+            }
 
             let invisible_char = if let Some(invisible) = snapshot
                 .buffer_snapshot()
@@ -496,6 +624,7 @@ fn show_hover(
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
                     last_bounds: Rc::new(Cell::new(None)),
+                    allow_remote_images: false,
                     _subscription: subscription,
                 })
             }
@@ -559,6 +688,7 @@ fn show_hover(
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
                     last_bounds: Rc::new(Cell::new(None)),
+                    allow_remote_images: false,
                     _subscription: subscription,
                 });
             }
@@ -585,6 +715,39 @@ fn show_hover(
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
                     last_bounds: Rc::new(Cell::new(None)),
+                    allow_remote_images: false,
+                    _subscription: subscription,
+                });
+            }
+
+            // Native npm package hover for package.json / pnpm-workspace.yaml,
+            // replacing the disabled built-in package-version-server hover.
+            if let Some((markdown_text, range)) =
+                crate::version_lens::npm_package_hover(&this, anchor, cx).await
+            {
+                let blocks = vec![HoverBlock {
+                    text: markdown_text,
+                    kind: HoverBlockKind::Markdown,
+                }];
+                let parsed_content = parse_blocks(&blocks, language_registry.as_ref(), None, cx);
+                let scroll_handle = ScrollHandle::new();
+                let subscription = this
+                    .update(cx, |_, cx| {
+                        parsed_content
+                            .as_ref()
+                            .map(|parsed_content| cx.observe(parsed_content, |_, _, cx| cx.notify()))
+                    })
+                    .ok()
+                    .flatten();
+                hover_highlights.push(range.clone());
+                info_popovers.push(InfoPopover {
+                    symbol_range: RangeInEditor::Text(range),
+                    parsed_content,
+                    scroll_handle,
+                    keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
+                    anchor: Some(anchor),
+                    last_bounds: Rc::new(Cell::new(None)),
+                    allow_remote_images: true,
                     _subscription: subscription,
                 });
             }
@@ -869,6 +1032,9 @@ pub struct HoverState {
     pub info_task: Option<Task<Option<()>>>,
     pub closest_mouse_distance: Option<Pixels>,
     pub hiding_delay_task: Option<Task<()>>,
+    /// Background fetch of quick-fix code actions for the current diagnostic
+    /// popover; dropped (cancelled) when the hover is hidden or re-triggered.
+    pub quick_fix_task: Option<Task<()>>,
 }
 
 impl HoverState {
@@ -1026,6 +1192,14 @@ impl HoverState {
     }
 }
 
+/// Resolves remote (http/https) image URLs in markdown to a loadable image
+/// source. Relative and `data:` URLs are left to the markdown renderer's own
+/// handling. Used for README images/badges in the npm package hover.
+fn resolve_remote_image(dest_url: &str) -> Option<ImageSource> {
+    (dest_url.starts_with("http://") || dest_url.starts_with("https://"))
+        .then(|| ImageSource::Resource(Resource::Uri(SharedUri::from(dest_url.to_string()))))
+}
+
 pub struct InfoPopover {
     pub symbol_range: RangeInEditor,
     pub parsed_content: Option<Entity<Markdown>>,
@@ -1033,6 +1207,9 @@ pub struct InfoPopover {
     pub keyboard_grace: Rc<RefCell<bool>>,
     pub anchor: Option<Anchor>,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Whether to load remote (http/https) images in the markdown. Enabled for
+    /// the npm package hover (README images/badges); off for LSP hovers.
+    pub allow_remote_images: bool,
     _subscription: Option<Subscription>,
 }
 
@@ -1081,6 +1258,28 @@ impl InfoPopover {
                 cx.stop_propagation();
             })
             .when_some(self.parsed_content.clone(), |this, markdown| {
+                let mut markdown_element =
+                    MarkdownElement::new(markdown, hover_markdown_style(window, cx))
+                        .scroll_handle(self.scroll_handle.clone())
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button_visibility: CopyButtonVisibility::Hidden,
+                            wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
+                            border: false,
+                        })
+                        .on_url_click(move |link, window, cx| {
+                            open_markdown_url(
+                                this2
+                                    .read_with(cx, |editor, _| editor.workspace())
+                                    .ok()
+                                    .flatten(),
+                                link,
+                                window,
+                                cx,
+                            )
+                        });
+                if self.allow_remote_images {
+                    markdown_element = markdown_element.image_resolver(resolve_remote_image);
+                }
                 this.child(
                     div()
                         .id("info-md-container")
@@ -1088,27 +1287,7 @@ impl InfoPopover {
                         .max_w(max_size.width)
                         .max_h(max_size.height)
                         .track_scroll(&self.scroll_handle)
-                        .child(
-                            MarkdownElement::new(markdown, hover_markdown_style(window, cx))
-                                .scroll_handle(self.scroll_handle.clone())
-                                .code_block_renderer(markdown::CodeBlockRenderer::Default {
-                                    copy_button_visibility: CopyButtonVisibility::Hidden,
-                                    wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
-                                    border: false,
-                                })
-                                .on_url_click(move |link, window, cx| {
-                                    open_markdown_url(
-                                        this2
-                                            .read_with(cx, |editor, _| editor.workspace())
-                                            .ok()
-                                            .flatten(),
-                                        link,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .p_2(),
-                        ),
+                        .child(markdown_element.p_2()),
                 )
                 .custom_scrollbars(
                     Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
@@ -1131,6 +1310,15 @@ impl InfoPopover {
     }
 }
 
+/// A quick-fix code action offered as a clickable button in the diagnostic
+/// hover popover.
+struct DiagnosticQuickFix {
+    title: SharedString,
+    action: CodeAction,
+    provider: Rc<dyn CodeActionProvider>,
+    buffer: Entity<Buffer>,
+}
+
 pub struct DiagnosticPopover {
     pub(crate) local_diagnostic: DiagnosticEntry<Anchor>,
     markdown: Entity<Markdown>,
@@ -1141,6 +1329,9 @@ pub struct DiagnosticPopover {
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     _subscription: Subscription,
     pub scroll_handle: ScrollHandle,
+    /// Quick fixes for this diagnostic, fetched in the background after the
+    /// popover is shown.
+    quick_fixes: Vec<DiagnosticQuickFix>,
 }
 
 impl DiagnosticPopover {
@@ -1152,6 +1343,8 @@ impl DiagnosticPopover {
     ) -> AnyElement {
         let keyboard_grace = Rc::clone(&self.keyboard_grace);
         let this = cx.entity().downgrade();
+        let editor_for_fixes = cx.entity().downgrade();
+        let separator_color = cx.theme().colors().border_variant;
         let bounds_cell = self.last_bounds.clone();
         div()
             .id("diagnostic")
@@ -1234,6 +1427,37 @@ impl DiagnosticPopover {
                                 ),
                             ),
                     )
+                    .when(!self.quick_fixes.is_empty(), |container| {
+                        container.child(
+                            v_flex()
+                                .mt_1()
+                                .pt_1()
+                                .border_t_1()
+                                .border_color(separator_color)
+                                .children(self.quick_fixes.iter().enumerate().map(
+                                    |(index, fix)| {
+                                        let editor = editor_for_fixes.clone();
+                                        ListItem::new(("diagnostic-quick-fix", index))
+                                            .inset(true)
+                                            .start_slot(
+                                                Icon::new(IconName::BoltFilled)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(Label::new(fix.title.clone()))
+                                            .on_click(move |_, window, cx| {
+                                                editor
+                                                    .update(cx, |editor, cx| {
+                                                        editor.apply_diagnostic_quick_fix(
+                                                            index, window, cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            })
+                                    },
+                                )),
+                        )
+                    })
                     .child(div().absolute().top_1().right_1().child({
                         let message = self.local_diagnostic.diagnostic.message.clone();
                         CopyButton::new("copy-diagnostic", message).tooltip_label("Copy Diagnostic")

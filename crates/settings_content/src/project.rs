@@ -770,6 +770,13 @@ pub struct InlineDiagnosticsSettingsContent {
     pub min_column: Option<u32>,
 
     pub max_severity: Option<DiagnosticSeverityContent>,
+
+    /// Whether to tint the background of the whole line that contains a
+    /// diagnostic with a faint severity color, like the VS Code "Error Lens"
+    /// extension.
+    ///
+    /// Default: false
+    pub highlight_line: Option<bool>,
 }
 
 #[with_fallible_options]

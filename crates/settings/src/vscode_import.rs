@@ -245,6 +245,21 @@ impl VsCodeSettings {
                 "solid" => Some(false),
                 _ => None,
             }),
+            cursor_smooth_caret_animation: self
+                .read_enum("editor.cursorSmoothCaretAnimation", |s| match s {
+                    "on" | "explicit" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                }),
+            cursor_smooth_blink: self.read_enum("editor.cursorBlinking", |s| match s {
+                "smooth" | "phase" => Some(true),
+                "blink" | "expand" | "solid" => Some(false),
+                _ => None,
+            }),
+            // No VS Code equivalent; Zed-specific opt-in.
+            cursor_smooth_selection: None,
+            // No VS Code equivalent; Zed-specific opt-in.
+            smooth_typing: None,
             cursor_shape: self.read_enum("editor.cursorStyle", |s| match s {
                 "block" => Some(CursorShape::Block),
                 "block-outline" => Some(CursorShape::Hollow),
@@ -317,6 +332,14 @@ impl VsCodeSettings {
             completion_menu_scrollbar: None,
             completion_detail_alignment: None,
             completion_menu_item_kind: None,
+            completion_recency: self.read_enum("editor.suggestSelection", |s| match s {
+                "recentlyUsed" | "recentlyUsedByPrefix" => Some(true),
+                "first" => Some(false),
+                _ => None,
+            }),
+            completion_locality: self.read_bool("editor.suggest.localityBonus"),
+            // No VS Code equivalent; Zed-specific.
+            inline_diagnostic_font: None,
             diff_view_style: None,
             minimum_split_diff_width: None,
         }
@@ -882,6 +905,8 @@ impl VsCodeSettings {
                 }),
             button: None,
             copy_on_select: self.read_bool("terminal.integrated.copyOnSelection"),
+            // No VS Code equivalent; Zed-specific opt-in.
+            smooth_caret: None,
             cursor_shape: self.read_enum("terminal.integrated.cursorStyle", |s| match s {
                 "block" => Some(CursorShapeContent::Block),
                 "line" => Some(CursorShapeContent::Bar),

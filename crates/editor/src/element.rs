@@ -13,7 +13,7 @@ use crate::{
     EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
     HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
     MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    SelectionDragState, SizingBehavior, SmoothBlinkState, SmoothCaretState, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     display_map::{
@@ -61,6 +61,7 @@ use multi_buffer::{
 };
 
 use project::{
+    Project, ProjectPath, WorktreeId,
     debugger::breakpoint_store::{Breakpoint, BreakpointSessionState},
     project_settings::ProjectSettings,
 };
@@ -79,14 +80,17 @@ use std::{
     ops::{Deref, Range},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
 use theme::{ActiveTheme, Appearance, PlayerColor};
 use theme_settings::BufferLineHeight;
 use ui::utils::ensure_minimum_contrast;
-use ui::{ButtonLike, POPOVER_Y_PADDING, Tooltip, prelude::*, scrollbars::ShowScrollbar};
+use ui::{
+    ButtonLike, ContextMenu, POPOVER_Y_PADDING, PopoverMenu, Tooltip, prelude::*,
+    scrollbars::ShowScrollbar,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -959,10 +963,51 @@ impl EditorElement {
         cx: &mut App,
     ) -> Vec<CursorLayout> {
         let mut autoscroll_bounds = None;
+        // Duration (seconds) of the smooth-caret glide; smaller is snappier.
+        const SMOOTH_CARET_DURATION: f32 = 0.09;
         let cursor_layouts = self.editor.update(cx, |editor, cx| {
             let mut cursors = Vec::new();
 
-            let show_local_cursors = editor.show_local_cursors(window, cx);
+            let smooth_caret_enabled =
+                EditorSettings::get_global(cx).cursor_smooth_caret_animation;
+            if !smooth_caret_enabled {
+                editor.smooth_caret = None;
+            }
+
+            // Smooth blink: fade the local cursor opacity toward the blink
+            // manager's on/off target instead of toggling it abruptly.
+            let smooth_blink = EditorSettings::get_global(cx).cursor_smooth_blink
+                && !editor.read_only(cx)
+                && editor.focus_handle.is_focused(window);
+            let (show_local_cursors, blink_opacity) = if smooth_blink {
+                let target = if editor.blink_manager.read(cx).visible() {
+                    1.0
+                } else {
+                    0.0
+                };
+                let now = Instant::now();
+                let state = editor.smooth_blink.get_or_insert_with(|| SmoothBlinkState {
+                    from: target,
+                    to: target,
+                    start: now,
+                });
+                if (state.to - target).abs() > f32::EPSILON {
+                    // Blink target flipped: ease from the cursor's current opacity.
+                    let current = state.opacity(now);
+                    state.from = current;
+                    state.to = target;
+                    state.start = now;
+                }
+                let opacity = state.opacity(now);
+                if !state.is_finished(now) {
+                    window.request_animation_frame();
+                }
+                // Paint the local cursor whenever focused; opacity carries the blink.
+                (true, opacity)
+            } else {
+                editor.smooth_blink = None;
+                (editor.show_local_cursors(window, cx), 1.0)
+            };
 
             for (player_color, selections) in selections {
                 for selection in selections {
@@ -1094,10 +1139,62 @@ impl EditorElement {
                         }
                     }
 
+                    // Smoothly glide the primary caret toward its new position in
+                    // scroll-independent document space, so scrolling tracks instantly
+                    // while cursor *moves* animate (matching VS Code / Cursor).
+                    let origin = if smooth_caret_enabled
+                        && selection.is_local
+                        && selection.is_newest
+                    {
+                        let scroll_px: gpui::Point<Pixels> =
+                            point(scroll_pixel_position.x.into(), scroll_pixel_position.y.into());
+                        let target = point(x, y) + scroll_px;
+                        let now = Instant::now();
+                        let state = editor.smooth_caret.get_or_insert_with(|| SmoothCaretState {
+                            from: target,
+                            to: target,
+                            start: now,
+                        });
+                        // Re-aim the glide whenever the caret's destination changes.
+                        if f32::from(target.x - state.to.x).abs() > 0.5
+                            || f32::from(target.y - state.to.y).abs() > 0.5
+                        {
+                            let current = state.position(now, SMOOTH_CARET_DURATION);
+                            let dx = f32::from(target.x - current.x);
+                            let dy = f32::from(target.y - current.y);
+                            if (dx * dx + dy * dy).sqrt() > f32::from(text_hitbox.size.height) {
+                                // Large jump (go-to-definition, page scroll): snap so the
+                                // caret doesn't streak across the view.
+                                state.from = target;
+                                state.to = target;
+                                state.start = now - Duration::from_secs_f32(SMOOTH_CARET_DURATION);
+                            } else {
+                                // Start a fresh glide from the caret's current on-screen spot.
+                                state.from = current;
+                                state.to = target;
+                                state.start = now;
+                            }
+                        }
+                        let position = state.position(now, SMOOTH_CARET_DURATION);
+                        if !state.is_finished(now, SMOOTH_CARET_DURATION) {
+                            window.request_animation_frame();
+                        }
+                        position - scroll_px
+                    } else {
+                        point(x, y)
+                    };
+
+                    let cursor_color = {
+                        let mut color = player_color.cursor;
+                        if selection.is_local {
+                            color.a *= blink_opacity;
+                        }
+                        color
+                    };
                     let mut cursor = CursorLayout {
-                        color: player_color.cursor,
+                        color: cursor_color,
                         block_width,
-                        origin: point(x, y),
+                        origin,
                         line_height,
                         shape: selection.cursor_shape,
                         block_text,
@@ -1637,7 +1734,7 @@ impl EditorElement {
         end_row: DisplayRow,
         line_height: Pixels,
         em_width: Pixels,
-        style: &EditorStyle,
+        _style: &EditorStyle,
         window: &mut Window,
         cx: &mut App,
     ) -> HashMap<DisplayRow, AnyElement> {
@@ -1661,30 +1758,40 @@ impl EditorElement {
 
         let active_diagnostics_group = self.editor.read(cx).active_diagnostic_group_id();
 
-        let diagnostics_by_rows = self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.snapshot(window, cx);
-            editor
-                .inline_diagnostics
-                .iter()
-                .filter(|(_, diagnostic)| diagnostic.severity <= max_severity)
-                .filter(|(_, diagnostic)| match active_diagnostics_group {
-                    Some(active_diagnostics_group) => {
-                        // Active diagnostics are all shown in the editor already, no need to display them inline
-                        diagnostic.group_id != active_diagnostics_group
-                    }
-                    None => true,
-                })
-                .map(|(point, diag)| (point.to_display_point(&snapshot), diag.clone()))
-                .skip_while(|(point, _)| point.row() < start_row)
-                .take_while(|(point, _)| point.row() < end_row)
-                .filter(|(point, _)| !row_block_types.contains_key(&point.row()))
-                .fold(HashMap::default(), |mut acc, (point, diagnostic)| {
-                    acc.entry(point.row())
-                        .or_insert_with(Vec::new)
-                        .push(diagnostic);
-                    acc
-                })
-        });
+        let (diagnostics_by_rows, cursor_row, code_actions_available) =
+            self.editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let display_snapshot = &snapshot.display_snapshot;
+                let cursor_row = editor
+                    .selections
+                    .newest::<Point>(display_snapshot)
+                    .head()
+                    .to_display_point(display_snapshot)
+                    .row();
+                let code_actions_available = editor.has_available_code_actions_for_selection();
+                let diagnostics_by_rows = editor
+                    .inline_diagnostics
+                    .iter()
+                    .filter(|(_, diagnostic)| diagnostic.severity <= max_severity)
+                    .filter(|(_, diagnostic)| match active_diagnostics_group {
+                        Some(active_diagnostics_group) => {
+                            // Active diagnostics are all shown in the editor already, no need to display them inline
+                            diagnostic.group_id != active_diagnostics_group
+                        }
+                        None => true,
+                    })
+                    .map(|(point, diag)| (point.to_display_point(&snapshot), diag.clone()))
+                    .skip_while(|(point, _)| point.row() < start_row)
+                    .take_while(|(point, _)| point.row() < end_row)
+                    .filter(|(point, _)| !row_block_types.contains_key(&point.row()))
+                    .fold(HashMap::default(), |mut acc, (point, diagnostic)| {
+                        acc.entry(point.row())
+                            .or_insert_with(Vec::new)
+                            .push(diagnostic);
+                        acc
+                    });
+                (diagnostics_by_rows, cursor_row, code_actions_available)
+            });
 
         if diagnostics_by_rows.is_empty() {
             return HashMap::default();
@@ -1762,20 +1869,66 @@ impl EditorElement {
                 1.0
             };
 
+            // Quiet annotation styling: a small severity dot — or a clickable
+            // lightbulb when a quick fix is available on the cursor's line — then
+            // the message in a muted, italic font. The line tint (when enabled)
+            // supplies the background, so none is set here.
+            let severity = diagnostic_to_render.severity;
+            let severity_color = severity_to_color(&severity);
+            let message_color = cx.theme().colors().text_muted;
+            let message_font =
+                match EditorSettings::get_global(cx).inline_diagnostic_font.as_ref() {
+                    Some(family) => gpui::font(family.clone()),
+                    None => theme_settings::ThemeSettings::get_global(cx).ui_font.clone(),
+                };
+
+            let leading = if row == cursor_row && code_actions_available {
+                let editor = self.editor.downgrade();
+                ui::IconButton::new(("diagnostic-fix", row.0), ui::IconName::Lightbulb)
+                    .icon_size(ui::IconSize::XSmall)
+                    .icon_color(severity_color)
+                    .shape(ui::IconButtonShape::Square)
+                    .on_click(move |_, window, cx| {
+                        editor
+                            .update(cx, |editor, cx| {
+                                window.focus(&editor.focus_handle(cx), cx);
+                                editor.toggle_code_actions(
+                                    &crate::actions::ToggleCodeActions {
+                                        deployed_from: Some(CodeActionSource::Indicator(row)),
+                                        quick_launch: false,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_none()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(severity_color.color(cx))
+                    .into_any_element()
+            };
+
             let mut element = h_flex()
                 .id(("diagnostic", row.0))
                 .h(line_height)
                 .w_full()
+                .gap_2()
                 .px_1()
-                .rounded_xs()
                 .opacity(opacity)
-                .bg(severity_to_color(&diagnostic_to_render.severity)
-                    .color(cx)
-                    .opacity(0.05))
-                .text_color(severity_to_color(&diagnostic_to_render.severity).color(cx))
-                .text_sm()
-                .font(style.text.font())
-                .child(diagnostic_to_render.message.clone())
+                .child(leading)
+                .child(
+                    div()
+                        .font(message_font)
+                        .text_sm()
+                        .italic()
+                        .text_color(message_color)
+                        .child(diagnostic_to_render.message.clone()),
+                )
                 .into_any();
 
             element.prepaint_as_root(point(pos_x, pos_y), AvailableSpace::min_size(), window, cx);
@@ -5535,23 +5688,53 @@ impl EditorElement {
                 Pixels::ZERO
             };
 
+            let smooth_selection_enabled =
+                EditorSettings::get_global(cx).cursor_smooth_selection;
+            let now = Instant::now();
+            let mut animated_selection = false;
+
             for (player_color, selections) in &layout.selections {
                 for selection in selections.iter() {
-                    self.paint_highlighted_range(
-                        selection.range.clone(),
-                        true,
-                        player_color.selection,
-                        corner_radius,
-                        corner_radius * 2.,
-                        layout,
-                        window,
-                    );
+                    let painted_smoothly = smooth_selection_enabled
+                        && selection.is_local
+                        && selection.is_newest
+                        && !selection.range.is_empty()
+                        && self.paint_smooth_selection(
+                            selection,
+                            player_color.selection,
+                            corner_radius,
+                            corner_radius * 2.,
+                            layout,
+                            now,
+                            window,
+                            cx,
+                        );
+                    animated_selection |= painted_smoothly;
+
+                    if !painted_smoothly {
+                        self.paint_highlighted_range(
+                            selection.range.clone(),
+                            true,
+                            player_color.selection,
+                            corner_radius,
+                            corner_radius * 2.,
+                            layout,
+                            window,
+                        );
+                    }
 
                     if selection.is_local && !selection.range.is_empty() {
                         invisible_display_ranges.push(selection.range.clone());
                     }
                 }
             }
+
+            // Reset the glide once it no longer applies, so the next selection
+            // starts fresh at its own anchor instead of sliding in from afar.
+            if !animated_selection {
+                self.editor.update(cx, |editor, _| editor.smooth_selection = None);
+            }
+
             invisible_display_ranges
         })
     }
@@ -6192,6 +6375,173 @@ impl EditorElement {
         }
     }
 
+    /// Paints the newest local selection with its moving (caret-side) edge glided
+    /// toward its target, so the highlight follows the caret smoothly instead of
+    /// snapping. Returns `false` (so the caller snaps instead) when either end of
+    /// the selection is scrolled out of view, since the off-screen line layouts
+    /// needed to build a correct region aren't available.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_smooth_selection(
+        &self,
+        selection: &SelectionLayout,
+        color: Hsla,
+        corner_radius: Pixels,
+        line_end_overshoot: Pixels,
+        layout: &EditorLayout,
+        now: Instant,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        const SMOOTH_SELECTION_DURATION: f32 = 0.09;
+
+        let start_row = layout.visible_display_row_range.start;
+        let end_row = layout.visible_display_row_range.end;
+        let head = selection.head;
+        let anchor = if head == selection.range.end {
+            selection.range.start
+        } else {
+            selection.range.end
+        };
+
+        let row_in_view = |row: DisplayRow| row >= start_row && row < end_row;
+        if !row_in_view(head.row()) || !row_in_view(anchor.row()) {
+            return false;
+        }
+
+        let content_origin = layout.content_origin;
+        let line_height = layout.position_map.line_height;
+        let scroll_position = layout.position_map.scroll_position;
+        let scroll_pixel_x = layout.position_map.scroll_pixel_position.x;
+        let text_bounds = layout.position_map.text_hitbox.bounds;
+
+        let column_x = |point: DisplayPoint| -> Pixels {
+            let line_layout =
+                &layout.position_map.line_layouts[point.row().minus(start_row) as usize];
+            let alignment_offset =
+                line_layout.alignment_offset(layout.text_align, layout.content_width);
+            content_origin.x
+                + Pixels::from(
+                    ScrollPixelOffset::from(
+                        line_layout.x_for_index(point.column() as usize) + alignment_offset,
+                    ) - scroll_pixel_x,
+                )
+        };
+        let line_start_x = |row: DisplayRow| -> Pixels {
+            let line_layout = &layout.position_map.line_layouts[row.minus(start_row) as usize];
+            let alignment_offset =
+                line_layout.alignment_offset(layout.text_align, layout.content_width);
+            content_origin.x + alignment_offset - Pixels::from(scroll_pixel_x)
+        };
+        let line_end_x = |row: DisplayRow| -> Pixels {
+            let line_layout = &layout.position_map.line_layouts[row.minus(start_row) as usize];
+            let alignment_offset =
+                line_layout.alignment_offset(layout.text_align, layout.content_width);
+            Pixels::from(
+                ScrollPixelOffset::from(
+                    content_origin.x + line_layout.width + alignment_offset + line_end_overshoot,
+                ) - scroll_pixel_x,
+            )
+        };
+
+        // Document-space (scroll-independent) target for the moving edge.
+        let head_target = {
+            let head_line =
+                &layout.position_map.line_layouts[head.row().minus(start_row) as usize];
+            let head_alignment =
+                head_line.alignment_offset(layout.text_align, layout.content_width);
+            point(
+                head_line.x_for_index(head.column() as usize) + head_alignment,
+                line_height * head.row().0 as f32,
+            )
+        };
+
+        let (head_doc, finished) = self.editor.update(cx, |editor, _| {
+            let state = editor.smooth_selection.get_or_insert(SmoothCaretState {
+                from: head_target,
+                to: head_target,
+                start: now,
+            });
+            // Re-aim the glide whenever the moving edge's destination changes.
+            if f32::from(head_target.x - state.to.x).abs() > 0.5
+                || f32::from(head_target.y - state.to.y).abs() > 0.5
+            {
+                let current = state.position(now, SMOOTH_SELECTION_DURATION);
+                let dx = f32::from(head_target.x - current.x);
+                let dy = f32::from(head_target.y - current.y);
+                if (dx * dx + dy * dy).sqrt() > f32::from(text_bounds.size.height) {
+                    // Large jump (click far away, page move): snap, don't streak.
+                    state.from = head_target;
+                    state.to = head_target;
+                    state.start = now - Duration::from_secs_f32(SMOOTH_SELECTION_DURATION);
+                } else {
+                    state.from = current;
+                    state.to = head_target;
+                    state.start = now;
+                }
+            }
+            (
+                state.position(now, SMOOTH_SELECTION_DURATION),
+                state.is_finished(now, SMOOTH_SELECTION_DURATION),
+            )
+        });
+        if !finished {
+            window.request_animation_frame();
+        }
+
+        // Glide only the horizontal edge; keep the head on its real row so whole
+        // lines fill cleanly (no per-line "snap to full width" as the edge would
+        // cross a line midpoint). The caret itself still glides vertically.
+        let head_x =
+            content_origin.x + Pixels::from(ScrollPixelOffset::from(head_doc.x) - scroll_pixel_x);
+        let head_row = head.row();
+
+        let anchor_x = column_x(anchor);
+        let anchor_row = anchor.row();
+
+        // Order the two ends top-to-bottom (then left-to-right on the same row).
+        let ((top_row, top_x), (bottom_row, bottom_x)) =
+            if head_row < anchor_row || (head_row == anchor_row && head_x <= anchor_x) {
+                ((head_row, head_x), (anchor_row, anchor_x))
+            } else {
+                ((anchor_row, anchor_x), (head_row, head_x))
+            };
+
+        let single_row = top_row == bottom_row;
+        let lines = (top_row.0..=bottom_row.0)
+            .map(DisplayRow)
+            .map(|row| {
+                let (start_x, end_x) = if single_row {
+                    if top_x <= bottom_x {
+                        (top_x, bottom_x)
+                    } else {
+                        (bottom_x, top_x)
+                    }
+                } else if row == top_row {
+                    (top_x, line_end_x(row))
+                } else if row == bottom_row {
+                    (line_start_x(row), bottom_x)
+                } else {
+                    (line_start_x(row), line_end_x(row))
+                };
+                HighlightedRangeLine { start_x, end_x }
+            })
+            .collect();
+
+        let start_y = content_origin.y
+            + Pixels::from((top_row.as_f64() - scroll_position.y) * ScrollOffset::from(line_height));
+
+        HighlightedRange {
+            color,
+            line_height,
+            corner_radius,
+            start_y,
+            lines,
+        }
+        .paint(true, text_bounds, window);
+
+        true
+    }
+
     fn paint_inline_diagnostics(
         &mut self,
         layout: &mut EditorLayout,
@@ -6656,6 +7006,70 @@ impl Gutter<'_> {
     }
 }
 
+/// A clickable folder segment in the breadcrumbs: opening it shows the files in
+/// that folder (VS Code-style), clicking one opens it.
+fn render_breadcrumb_folder(
+    index: usize,
+    name: SharedString,
+    folder_path: String,
+    worktree_id: WorktreeId,
+    project: Entity<Project>,
+    workspace: Entity<workspace::Workspace>,
+    text_style: gpui::TextStyle,
+) -> impl IntoElement {
+    PopoverMenu::new(("breadcrumb-folder", index))
+        .trigger(
+            ButtonLike::new(("breadcrumb-folder-btn", index))
+                .style(ButtonStyle::Transparent)
+                .size(ButtonSize::None)
+                .child(
+                    StyledText::new(name).with_default_highlights(&text_style, std::iter::empty()),
+                ),
+        )
+        .menu(move |window, cx| {
+            let folder = util::rel_path::RelPath::unix(&folder_path).ok()?;
+            let mut children: Vec<(SharedString, Arc<util::rel_path::RelPath>, bool)> = {
+                let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
+                let worktree = worktree.read(cx);
+                worktree
+                    .child_entries(folder)
+                    .map(|entry| {
+                        (
+                            SharedString::from(
+                                entry.path.file_name().unwrap_or_default().to_string(),
+                            ),
+                            entry.path.clone(),
+                            entry.is_dir(),
+                        )
+                    })
+                    .collect()
+            };
+            // Directories first, then files, each alphabetical.
+            children.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            });
+            let workspace = workspace.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for (entry_name, path, is_dir) in children {
+                    if is_dir {
+                        continue;
+                    }
+                    let target = ProjectPath { worktree_id, path };
+                    let workspace = workspace.clone();
+                    menu = menu.entry(entry_name, None, move |window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .open_path(target.clone(), None, true, window, cx)
+                                .detach_and_log_err(cx);
+                        });
+                    });
+                }
+                menu
+            }))
+        })
+}
+
 pub fn render_breadcrumb_text(
     mut segments: Vec<HighlightedText>,
     breadcrumb_font: Option<Font>,
@@ -6667,7 +7081,7 @@ pub fn render_breadcrumb_text(
 ) -> gpui::AnyElement {
     const MAX_SEGMENTS: usize = 12;
 
-    let element = h_flex().flex_grow_1().text_ui(cx);
+    let element = h_flex().flex_grow_1().gap_1().text_ui(cx);
 
     let prefix_end_ix = cmp::min(segments.len(), MAX_SEGMENTS / 2);
     let suffix_start_ix = cmp::max(
@@ -6685,6 +7099,69 @@ pub fn render_breadcrumb_text(
         );
     }
 
+    let editor = active_item
+        .downcast::<Editor>()
+        .map(|editor| editor.downgrade());
+
+    // Folder-path navigation: split the leading file-path segment into clickable
+    // folder dropdowns; the symbol segments after it are kept as-is.
+    let folder_nav = editor.as_ref().and_then(|editor| {
+        let editor = editor.upgrade()?;
+        let editor = editor.read(cx);
+        let buffer = editor.buffer().read(cx).as_singleton()?;
+        let file = buffer.read(cx).file()?;
+        let worktree_id = file.worktree_id(cx);
+        let rel_path = file.path().clone();
+        let project = editor.project()?.clone();
+        let workspace = editor.workspace()?;
+        let mut folders: Vec<(SharedString, String)> = Vec::new();
+        if let Some(parent) = rel_path.parent() {
+            for ancestor in parent.ancestors() {
+                if let Some(name) = ancestor.file_name() {
+                    folders.push((name.to_string().into(), ancestor.as_unix_str().to_string()));
+                }
+            }
+            folders.reverse();
+        }
+        let filename: SharedString = rel_path
+            .file_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| "untitled".to_string())
+            .into();
+        Some((worktree_id, project, workspace, folders, filename))
+    });
+
+    // Show just the filename in the trailing (symbol) chunk — the folders become
+    // their own dropdowns rendered before it.
+    if let Some((.., filename)) = &folder_nav
+        && let Some(first) = segments.first_mut()
+    {
+        first.text = filename.clone();
+        first.highlights = Vec::new();
+    }
+
+    // Style for the clickable folder dropdowns: identical font/size to the breadcrumb
+    // segments so the only visible difference from the filename is the muted color.
+    let folder_text_style = {
+        let mut text_style = window.text_style();
+        if let Some(font) = &breadcrumb_font {
+            text_style.font_family = font.family.clone();
+            text_style.font_features = font.features.clone();
+            text_style.font_style = font.style;
+            text_style.font_weight = font.weight;
+        }
+        text_style.font_size = TextSize::Ui.rems(cx).into();
+        text_style.color = Color::Muted.color(cx);
+        text_style
+    };
+
+    // When folder navigation is active, segment 0 is the filename (the "active file"),
+    // which should be the bright/highlighted one. Otherwise highlight the trailing segment.
+    let bright_segment_ix = if folder_nav.is_some() {
+        0
+    } else {
+        segments.len().saturating_sub(1)
+    };
     let highlighted_segments = segments.into_iter().enumerate().map(|(index, segment)| {
         let mut text_style = window.text_style();
         if let Some(font) = &breadcrumb_font {
@@ -6693,7 +7170,13 @@ pub fn render_breadcrumb_text(
             text_style.font_style = font.style;
             text_style.font_weight = font.weight;
         }
-        text_style.color = Color::Muted.color(cx);
+        text_style.font_size = TextSize::Ui.rems(cx).into();
+        // Brighten the active file / current segment; keep the rest muted, like the design.
+        text_style.color = if index == bright_segment_ix {
+            Color::Default.color(cx)
+        } else {
+            Color::Muted.color(cx)
+        };
 
         if index == 0
             && !workspace::TabBarSettings::get_global(cx).show
@@ -6727,16 +7210,36 @@ pub fn render_breadcrumb_text(
         breadcrumbs_stack
     };
 
-    let editor = active_item
-        .downcast::<Editor>()
-        .map(|editor| editor.downgrade());
-
     let has_project_path = active_item.project_path(cx).is_some();
 
     match editor {
-        Some(editor) => element
+        Some(editor) => {
+            let folder_segments: Vec<gpui::AnyElement> = match &folder_nav {
+                Some((worktree_id, project, workspace, folders, _)) => folders
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, (name, path))| {
+                        [
+                            render_breadcrumb_folder(
+                                index,
+                                name.clone(),
+                                path.clone(),
+                                *worktree_id,
+                                project.clone(),
+                                workspace.clone(),
+                                folder_text_style.clone(),
+                            )
+                            .into_any_element(),
+                            Label::new("›").color(Color::Placeholder).into_any_element(),
+                        ]
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            element
             .id("breadcrumb_container")
             .when(!multibuffer_header, |this| this.overflow_x_scroll())
+            .children(folder_segments)
             .child(
                 ButtonLike::new("toggle outline view")
                     .child(breadcrumbs)
@@ -6804,7 +7307,8 @@ pub fn render_breadcrumb_text(
                         })
                     }),
             )
-            .into_any_element(),
+            .into_any_element()
+        }
         None => element
             .h(rems_from_px(22.)) // Match the height and padding of the `ButtonLike` in the other arm.
             .pl_1()
@@ -8109,6 +8613,44 @@ impl Element for EditorElement {
                     let mut highlighted_rows = self
                         .editor
                         .update(cx, |editor, cx| editor.highlighted_display_rows(window, cx));
+
+                    // Error Lens-style line highlighting: tint the background of every
+                    // line that has a diagnostic with a faint severity color. Reuses the
+                    // same diagnostics shown inline so the message and the tint agree.
+                    if ProjectSettings::get_global(cx).diagnostics.inline.highlight_line {
+                        let mut diagnostic_rows: HashMap<DisplayRow, lsp::DiagnosticSeverity> =
+                            HashMap::default();
+                        for (anchor, diagnostic) in self.editor.read(cx).inline_diagnostics.iter() {
+                            let row = anchor.to_display_point(&snapshot.display_snapshot).row();
+                            diagnostic_rows
+                                .entry(row)
+                                .and_modify(|severity| {
+                                    *severity = (*severity).min(diagnostic.severity)
+                                })
+                                .or_insert(diagnostic.severity);
+                        }
+                        if !diagnostic_rows.is_empty() {
+                            let status = cx.theme().status();
+                            for (row, severity) in diagnostic_rows {
+                                // Use the vivid diagnostic colors (not the muted *_background
+                                // colors, which read brown/washed) at low alpha, like Error Lens.
+                                let base = match severity {
+                                    lsp::DiagnosticSeverity::WARNING => status.warning,
+                                    lsp::DiagnosticSeverity::INFORMATION => status.info,
+                                    lsp::DiagnosticSeverity::HINT => status.hint,
+                                    _ => status.error,
+                                };
+                                highlighted_rows.entry(row).or_insert_with(|| LineHighlight {
+                                    // Calmer "quiet diagnostic" tint (was 0.16, read as a
+                                    // loud wash); the severity color still comes through.
+                                    background: Hsla { a: 0.09, ..base }.into(),
+                                    border: None,
+                                    include_gutter: false,
+                                    type_id: None,
+                                });
+                            }
+                        }
+                    }
 
                     let mut highlighted_ranges = self
                         .editor_with_selections(cx)
@@ -10268,6 +10810,11 @@ impl CursorLayout {
             origin: self.origin + origin,
             size: size(self.block_width, self.line_height),
         }
+    }
+
+    /// Overrides the cursor's origin, e.g. to apply a smooth-motion animation.
+    pub fn set_origin(&mut self, origin: gpui::Point<Pixels>) {
+        self.origin = origin;
     }
 
     fn bounds(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {

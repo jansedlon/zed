@@ -17,6 +17,25 @@ pub struct EditorSettingsContent {
     ///
     /// Default: true
     pub cursor_blink: Option<bool>,
+    /// Whether to smoothly animate the cursor to its new position when it moves,
+    /// instead of jumping instantly (matching VS Code / Cursor).
+    ///
+    /// Default: false
+    pub cursor_smooth_caret_animation: Option<bool>,
+    /// Whether the cursor fades in and out smoothly when blinking, instead of
+    /// toggling on/off abruptly. Has no effect when `cursor_blink` is off.
+    ///
+    /// Default: false
+    pub cursor_smooth_blink: Option<bool>,
+    /// Whether the selection highlight glides to follow the caret as you select,
+    /// instead of snapping. Best paired with `cursor_smooth_caret_animation`.
+    ///
+    /// Default: false
+    pub cursor_smooth_selection: Option<bool>,
+    /// Whether newly typed (or pasted) text fades in instead of appearing instantly.
+    ///
+    /// Default: false
+    pub smooth_typing: Option<bool>,
     /// Cursor shape for the default editor.
     /// Can be "bar", "block", "underline", or "hollow".
     ///
@@ -258,6 +277,25 @@ pub struct EditorSettingsContent {
     ///
     /// Default: off
     pub completion_menu_item_kind: Option<CompletionMenuItemKind>,
+
+    /// Whether to pre-select the most recently accepted matching completion when
+    /// the completion menu opens, instead of always selecting the top-ranked one
+    /// (matching VS Code's `editor.suggestSelection: recentlyUsed`).
+    ///
+    /// Default: false
+    pub completion_recency: Option<bool>,
+
+    /// Whether to rank completions whose identifier appears near the cursor
+    /// higher (matching VS Code's `editor.suggest.localityBonus`).
+    ///
+    /// Default: false
+    pub completion_locality: Option<bool>,
+
+    /// Font family for the inline diagnostic (Error Lens) message. When unset,
+    /// the UI font is used.
+    ///
+    /// Default: null
+    pub inline_diagnostic_font: Option<String>,
 
     /// How to display diffs in the editor.
     ///

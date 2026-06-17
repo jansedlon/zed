@@ -761,6 +761,36 @@ List of `string` values
 
 `boolean` values
 
+## Cursor Smooth Caret Animation
+
+- Description: Whether to smoothly animate the cursor to its new position when it moves, instead of jumping instantly.
+- Setting: `cursor_smooth_caret_animation`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
+## Cursor Smooth Blink
+
+- Description: Whether the cursor fades in and out smoothly when blinking, instead of toggling on/off abruptly. Has no effect when `cursor_blink` is off.
+- Setting: `cursor_smooth_blink`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
+## Smooth Typing
+
+- Description: Whether newly typed (or pasted) text fades in instead of appearing instantly.
+- Setting: `smooth_typing`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
 ## Cursor Shape
 
 - Description: Cursor shape for the default editor.
@@ -4212,6 +4242,16 @@ List of `integer` column numbers
   }
 }
 ```
+
+### Terminal: Smooth Caret
+
+- Description: Whether the cursor glides smoothly to its new position while typing at the prompt, instead of jumping. Output, full-screen apps (vim, htop), and large jumps still move instantly.
+- Setting: `smooth_caret`
+- Default: `false`
+
+**Options**
+
+`boolean` values
 
 ### Terminal: Blinking
 

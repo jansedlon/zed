@@ -184,6 +184,8 @@ pub enum HighlightKey {
     Rename,
     SearchWithinRange,
     SelectedTextHighlight,
+    /// Per-opacity-bucket key for the smooth-typing fade-in of newly inserted text.
+    SmoothTypingFade(usize),
     SyntaxTreeView(usize),
     VimExchange,
 }

@@ -173,6 +173,7 @@ pub enum IconName {
     Json,
     Keyboard,
     Library,
+    Lightbulb,
     LineHeight,
     Link,
     Linux,

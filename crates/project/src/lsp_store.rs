@@ -83,7 +83,7 @@ use language::{
         AllLanguageSettings, FormatOnSave, Formatter, LanguageSettings, LineEndingSetting,
         all_language_settings,
     },
-    modeline, point_to_lsp,
+    completion_aside_detail, modeline, point_to_lsp,
     proto::{
         deserialize_anchor, deserialize_anchor_range, deserialize_version, serialize_anchor,
         serialize_anchor_range, serialize_version,
@@ -6906,17 +6906,23 @@ impl LspStore {
             .source
             .lsp_completion(true)
             .map(Cow::into_owned);
-        if let Some(lsp_documentation) = completion_item
+        let aside_detail = completion_item.as_ref().and_then(|completion_item| {
+            completion_aside_detail(
+                completion_item,
+                snapshot.language().map(|language| language.as_ref()),
+            )
+        });
+        let documentation = completion_item
             .as_ref()
             .and_then(|completion_item| completion_item.documentation.clone())
+            .map(CompletionDocumentation::from);
         {
             let mut completions = completions.borrow_mut();
             let completion = &mut completions[completion_index];
-            completion.documentation = Some(lsp_documentation.into());
-        } else {
-            let mut completions = completions.borrow_mut();
-            let completion = &mut completions[completion_index];
-            completion.documentation = Some(CompletionDocumentation::Undocumented);
+            completion.documentation = Some(
+                merge_completion_aside_detail(documentation, aside_detail)
+                    .unwrap_or(CompletionDocumentation::Undocumented),
+            );
         }
 
         let mut new_label = match completion_item {
@@ -14103,6 +14109,91 @@ fn remove_empty_hover_blocks(mut hover: Hover) -> Option<Hover> {
     }
 }
 
+/// Folds an adapter-provided completion signature (see
+/// `LspAdapter::completion_aside_detail`) into the documentation so it renders
+/// in the completion's documentation aside, matching VS Code, which shows type
+/// signatures in the side panel rather than crowding the completion row.
+fn merge_completion_aside_detail(
+    documentation: Option<CompletionDocumentation>,
+    aside_detail: Option<String>,
+) -> Option<CompletionDocumentation> {
+    let Some(signature) = aside_detail.filter(|signature| !signature.trim().is_empty()) else {
+        return documentation;
+    };
+    // Only TypeScript adapters populate `aside_detail` today, so the signature is
+    // highlighted as TypeScript (a superset of the JS/TSX signatures involved).
+    let mut markdown = format!("```typescript\n{}\n```", signature.trim());
+    if let Some(existing) = documentation
+        .as_ref()
+        .and_then(completion_documentation_source)
+        .map(str::trim)
+        .filter(|existing| !existing.is_empty())
+    {
+        markdown.push_str("\n\n");
+        markdown.push_str(existing);
+    }
+    Some(CompletionDocumentation::MultiLineMarkdown(markdown.into()))
+}
+
+fn completion_documentation_source(documentation: &CompletionDocumentation) -> Option<&str> {
+    match documentation {
+        CompletionDocumentation::Undocumented => None,
+        CompletionDocumentation::SingleLine(text)
+        | CompletionDocumentation::MultiLinePlainText(text)
+        | CompletionDocumentation::MultiLineMarkdown(text) => Some(&**text),
+        CompletionDocumentation::SingleLineAndMultiLinePlainText {
+            plain_text,
+            single_line,
+        } => plain_text.as_deref().or(Some(&**single_line)),
+    }
+}
+
+#[cfg(test)]
+mod completion_aside_tests {
+    use super::{CompletionDocumentation, merge_completion_aside_detail};
+
+    fn markdown(documentation: Option<CompletionDocumentation>) -> Option<String> {
+        match documentation {
+            Some(CompletionDocumentation::MultiLineMarkdown(text)) => Some(text.to_string()),
+            other => panic!("expected markdown documentation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_signature_into_documentation_aside() {
+        // No existing documentation: the signature becomes a fenced code block.
+        assert_eq!(
+            markdown(merge_completion_aside_detail(
+                None,
+                Some("const analyticsDb: 123".to_owned()),
+            )),
+            Some("```typescript\nconst analyticsDb: 123\n```".to_owned()),
+        );
+
+        // Existing documentation is preserved below the signature block.
+        assert_eq!(
+            markdown(merge_completion_aside_detail(
+                Some(CompletionDocumentation::MultiLineMarkdown("Doc body.".into())),
+                Some("const analyticsDb: 123".to_owned()),
+            )),
+            Some("```typescript\nconst analyticsDb: 123\n```\n\nDoc body.".to_owned()),
+        );
+
+        // No signature: documentation is returned untouched.
+        assert!(matches!(
+            merge_completion_aside_detail(
+                Some(CompletionDocumentation::SingleLine("hi".into())),
+                None,
+            ),
+            Some(CompletionDocumentation::SingleLine(_)),
+        ));
+        assert!(merge_completion_aside_detail(None, None).is_none());
+
+        // A whitespace-only signature is ignored.
+        assert!(merge_completion_aside_detail(None, Some("   ".to_owned())).is_none());
+    }
+}
+
 async fn populate_labels_for_completions(
     new_completions: Vec<CoreCompletion>,
     language: Option<Arc<Language>>,
@@ -14118,23 +14209,33 @@ async fn populate_labels_for_completions(
         })
         .collect::<Vec<_>>();
 
-    let mut labels = if let Some((language, lsp_adapter)) = language.as_ref().zip(lsp_adapter) {
-        lsp_adapter
-            .labels_for_completions(&lsp_completions, language)
-            .await
-            .log_err()
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    }
-    .into_iter()
-    .fuse();
+    let (labels, aside_details) =
+        if let Some((language, lsp_adapter)) = language.as_ref().zip(lsp_adapter.as_ref()) {
+            let labels = lsp_adapter
+                .labels_for_completions(&lsp_completions, language)
+                .await
+                .log_err()
+                .unwrap_or_default();
+            let aside_details = lsp_completions
+                .iter()
+                .map(|lsp_completion| completion_aside_detail(lsp_completion, Some(&**language)))
+                .collect::<Vec<_>>();
+            (labels, aside_details)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    // `labels` and `aside_details` are both indexed by `lsp_completions`, so they
+    // are advanced together (in lockstep) for each completion that has an LSP source.
+    let mut labels = labels.into_iter().fuse();
+    let mut aside_details = aside_details.into_iter().fuse();
 
     let mut completions = Vec::new();
     for completion in new_completions {
         match completion.source.lsp_completion(true) {
             Some(lsp_completion) => {
                 let documentation = lsp_completion.documentation.clone().map(|docs| docs.into());
+                let documentation =
+                    merge_completion_aside_detail(documentation, aside_details.next().flatten());
 
                 let mut label = labels.next().flatten().unwrap_or_else(|| {
                     CodeLabel::fallback_for_completion(&lsp_completion, language.as_deref())

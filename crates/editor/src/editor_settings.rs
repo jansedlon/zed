@@ -18,6 +18,10 @@ use ui::scrollbars::ShowScrollbar;
 #[derive(Clone, RegisterSetting)]
 pub struct EditorSettings {
     pub cursor_blink: bool,
+    pub cursor_smooth_caret_animation: bool,
+    pub cursor_smooth_blink: bool,
+    pub cursor_smooth_selection: bool,
+    pub smooth_typing: bool,
     pub cursor_shape: Option<CursorShape>,
     pub current_line_highlight: CurrentLineHighlight,
     pub selection_highlight: bool,
@@ -66,6 +70,9 @@ pub struct EditorSettings {
     pub completion_menu_scrollbar: ShowScrollbar,
     pub completion_detail_alignment: CompletionDetailAlignment,
     pub completion_menu_item_kind: CompletionMenuItemKind,
+    pub completion_recency: bool,
+    pub completion_locality: bool,
+    pub inline_diagnostic_font: Option<String>,
     pub diff_view_style: DiffViewStyle,
     pub minimum_split_diff_width: f32,
 }
@@ -205,6 +212,10 @@ impl Settings for EditorSettings {
         let sticky_scroll = editor.sticky_scroll.unwrap();
         Self {
             cursor_blink: editor.cursor_blink.unwrap(),
+            cursor_smooth_caret_animation: editor.cursor_smooth_caret_animation.unwrap(),
+            cursor_smooth_blink: editor.cursor_smooth_blink.unwrap(),
+            cursor_smooth_selection: editor.cursor_smooth_selection.unwrap(),
+            smooth_typing: editor.smooth_typing.unwrap(),
             cursor_shape: editor.cursor_shape.map(Into::into),
             current_line_highlight: editor.current_line_highlight.unwrap(),
             selection_highlight: editor.selection_highlight.unwrap(),
@@ -309,6 +320,9 @@ impl Settings for EditorSettings {
                 .unwrap(),
             completion_detail_alignment: editor.completion_detail_alignment.unwrap(),
             completion_menu_item_kind: editor.completion_menu_item_kind.unwrap(),
+            completion_recency: editor.completion_recency.unwrap(),
+            completion_locality: editor.completion_locality.unwrap(),
+            inline_diagnostic_font: editor.inline_diagnostic_font.clone(),
             diff_view_style: editor.diff_view_style.unwrap(),
             minimum_split_diff_width: editor.minimum_split_diff_width.unwrap(),
         }

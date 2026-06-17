@@ -918,6 +918,8 @@ impl TerminalBuilder {
             vi_mode_enabled: false,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
+            last_user_input: Instant::now(),
+            smooth_caret: None,
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
             #[cfg(windows)]
@@ -1141,6 +1143,8 @@ impl TerminalBuilder {
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 last_mouse_move_time: Instant::now(),
+                last_user_input: Instant::now(),
+                smooth_caret: None,
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
                 #[cfg(windows)]
@@ -1286,6 +1290,38 @@ enum TerminalType {
     DisplayOnly,
 }
 
+/// Duration of the smooth-caret glide while typing at the prompt.
+const SMOOTH_CARET_DURATION: f32 = 0.08;
+/// Only glide the caret for moves within this long of a user keystroke; later
+/// moves (program output) jump instantly.
+const SMOOTH_CARET_INPUT_WINDOW: Duration = Duration::from_millis(400);
+/// Same-line horizontal moves beyond this snap instead of gliding (e.g. Ctrl-A
+/// to the start of a long line).
+const SMOOTH_CARET_MAX_GLIDE: f32 = 250.0;
+
+/// Tween of the terminal cursor's position so it glides while typing at the
+/// prompt (see [`Terminal::smooth_caret_origin`]).
+struct SmoothCaretState {
+    from: GpuiPoint<Pixels>,
+    to: GpuiPoint<Pixels>,
+    start: Instant,
+}
+
+impl SmoothCaretState {
+    fn position(&self, now: Instant) -> GpuiPoint<Pixels> {
+        let t = ((now - self.start).as_secs_f32() / SMOOTH_CARET_DURATION).clamp(0., 1.);
+        let eased = 1. - (1. - t).powi(3);
+        GpuiPoint::new(
+            self.from.x + (self.to.x - self.from.x) * eased,
+            self.from.y + (self.to.y - self.from.y) * eased,
+        )
+    }
+
+    fn is_finished(&self, now: Instant) -> bool {
+        (now - self.start).as_secs_f32() >= SMOOTH_CARET_DURATION
+    }
+}
+
 pub struct Terminal {
     terminal_type: TerminalType,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
@@ -1309,6 +1345,11 @@ pub struct Terminal {
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
+    /// When the user last sent input (typing/keystroke), used to limit smooth-caret
+    /// gliding to moves caused by typing rather than program output.
+    last_user_input: Instant,
+    /// Smooth-caret glide animation state (when `terminal.smooth_caret` is on).
+    smooth_caret: Option<SmoothCaretState>,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
     mouse_down_hyperlink: Option<HyperlinkMatch>,
     #[cfg(windows)]
@@ -1864,11 +1905,70 @@ impl Terminal {
         self.events.push_back(InternalEvent::SetSelection(None));
 
         self.keyboard_input_sent = true;
+        self.last_user_input = Instant::now();
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.input_log.push(input.to_vec());
 
         self.write_to_pty(input);
+    }
+
+    /// Returns the cursor's display origin, smoothly glided toward `target` while
+    /// typing at the prompt, plus whether another animation frame is needed.
+    ///
+    /// The glide is limited to typing: it only animates on the live screen
+    /// (`display_offset == 0`), outside full-screen apps (no `ALT_SCREEN`), shortly
+    /// after a keystroke, for same-line moves within [`SMOOTH_CARET_MAX_GLIDE`].
+    /// Everything else (output, Enter/wraps, vim/htop, Ctrl-A, scrollback) snaps.
+    pub fn smooth_caret_origin(
+        &mut self,
+        target: GpuiPoint<Pixels>,
+        line_height: Pixels,
+        enabled: bool,
+    ) -> (GpuiPoint<Pixels>, bool) {
+        let now = Instant::now();
+        let animate = enabled
+            && self.last_content.display_offset == 0
+            && !self.last_content.mode.contains(Modes::ALT_SCREEN)
+            && now.duration_since(self.last_user_input) < SMOOTH_CARET_INPUT_WINDOW;
+
+        let state = self.smooth_caret.get_or_insert(SmoothCaretState {
+            from: target,
+            to: target,
+            start: now,
+        });
+
+        if !animate {
+            *state = SmoothCaretState {
+                from: target,
+                to: target,
+                start: now,
+            };
+            return (target, false);
+        }
+
+        if state.to != target {
+            let same_line = f32::from(target.y - state.to.y).abs() < f32::from(line_height) * 0.5;
+            let dx = f32::from(target.x - state.to.x).abs();
+            if same_line && dx <= SMOOTH_CARET_MAX_GLIDE {
+                // Glide from the caret's current on-screen spot to the new one.
+                let current = state.position(now);
+                state.from = current;
+                state.to = target;
+                state.start = now;
+            } else {
+                // New line, large horizontal jump, etc.: snap.
+                *state = SmoothCaretState {
+                    from: target,
+                    to: target,
+                    start: now,
+                };
+            }
+        }
+
+        // Only keep requesting frames while the caret is actually in motion.
+        let animating = state.from != state.to && !state.is_finished(now);
+        (state.position(now), animating)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1969,6 +2069,7 @@ impl Terminal {
     }
 
     pub fn try_keystroke(&mut self, keystroke: &Keystroke, option_as_meta: bool) -> bool {
+        self.last_user_input = Instant::now();
         if self.vi_mode_enabled {
             self.vi_motion(keystroke);
             return true;

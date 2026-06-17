@@ -2041,6 +2041,85 @@ impl ProjectPanel {
         self.add_entry(true, window, cx)
     }
 
+    /// Reveals (selects, scrolls to, and focuses) the file open in the active
+    /// editor within the project tree.
+    fn reveal_active_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(item) = workspace.read(cx).active_item(cx) else {
+            return;
+        };
+        let Some(project_path) = item.project_path(cx) else {
+            return;
+        };
+        let project = self.project.clone();
+        let Some(entry_id) = project
+            .read(cx)
+            .entry_for_path(&project_path, cx)
+            .map(|entry| entry.id)
+        else {
+            return;
+        };
+        if self.reveal_entry(project, entry_id, false, window, cx).is_ok() {
+            cx.emit(PanelEvent::Activate);
+        }
+    }
+
+    /// The explorer header: title + new file / new folder / reveal current /
+    /// collapse-all actions, styled to match the design.
+    fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .h(px(30.))
+            .px_2()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Label::new("EXPLORER")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        IconButton::new("project-panel-reveal-current", IconName::Crosshair)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Reveal Current File"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reveal_active_file(window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("project-panel-new-file", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New File"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_file(&NewFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("project-panel-new-folder", IconName::FolderOpenAdd)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New Folder"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_directory(&NewDirectory, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("project-panel-collapse-all", IconName::ListCollapse)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Collapse All"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.collapse_all_entries(&CollapseAllEntries, window, cx)
+                            })),
+                    ),
+            )
+    }
+
     fn add_entry(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some((worktree_id, entry_id)) = self
             .selection
@@ -5424,14 +5503,21 @@ impl ProjectPanel {
             marked_selections: Arc::from(self.marked_entries.clone()),
         };
 
+        // The active (selected) file gets the design's soft accent treatment — a
+        // tinted background plus an accent left-bar (added to the row below).
+        let accent = cx.theme().colors().text_accent;
         let bg_color = if is_marked {
             item_colors.marked
+        } else if is_active {
+            accent.opacity(0.08)
         } else {
             item_colors.default
         };
 
         let bg_hover_color = if is_marked {
             item_colors.marked
+        } else if is_active {
+            accent.opacity(0.12)
         } else {
             item_colors.hover
         };
@@ -5515,10 +5601,24 @@ impl ProjectPanel {
             .group(GROUP_NAME)
             .cursor_pointer()
             .rounded_none()
+            // A touch more vertical breathing room per row (the list re-measures
+            // item height, so this stays uniform).
+            .py_0p5()
             .bg(bg_color)
             .border_1()
             .border_r_2()
             .border_color(border_color)
+            .when(is_active, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(accent),
+                )
+            })
             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
             .when(is_sticky, |this| this.block_mouse_except_scroll())
             .when(!is_sticky, |this| {
@@ -6652,7 +6752,7 @@ impl Render for ProjectPanel {
 
         let is_local = project.is_local();
 
-        if has_worktree {
+        let panel_body = if has_worktree {
             let item_count = self
                 .state
                 .visible_entries
@@ -7270,7 +7370,12 @@ impl Render for ProjectPanel {
                         ))
                     })
                 })
-        }
+        };
+
+        v_flex()
+            .size_full()
+            .child(self.render_panel_header(cx))
+            .child(div().flex_1().min_h_0().child(panel_body))
     }
 }
 

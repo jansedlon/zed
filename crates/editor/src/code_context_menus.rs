@@ -1,13 +1,14 @@
 use crate::scroll::ScrollAmount;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    AnyElement, Entity, Focusable, FontWeight, ListSizingBehavior, ScrollHandle, ScrollStrategy,
-    SharedString, Size, StrikethroughStyle, StyledText, Task, TaskExt, UniformListScrollHandle,
-    div, px, uniform_list,
+    AnyElement, App, Entity, Focusable, FontWeight, Global, ListSizingBehavior, ScrollHandle,
+    ScrollStrategy, SharedString, Size, StrikethroughStyle, StyledText, Task, TaskExt,
+    UniformListScrollHandle, div, px, uniform_list,
 };
+use db::kvp::GlobalKeyValueStore;
 use itertools::Itertools;
 use language::CodeLabel;
-use language::{Buffer, LanguageName, LanguageRegistry};
+use language::{Buffer, BufferSnapshot, LanguageName, LanguageRegistry, WordsQuery};
 use lsp::{CompletionItemKind, CompletionItemTag};
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement};
 use multi_buffer::Anchor;
@@ -18,8 +19,8 @@ use project::{CompletionDisplayOptions, CompletionSource};
 use task::DebugScenario;
 use task::TaskContext;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{
     cell::RefCell,
     cmp::{Reverse, min},
@@ -42,12 +43,116 @@ use crate::{
     split_words, styled_runs_for_code_label,
 };
 use crate::{CodeActionSource, EditorSettings};
-use collections::{HashSet, VecDeque};
+use collections::{HashMap, HashSet, VecDeque};
 use settings::{CompletionDetailAlignment, CompletionMenuItemKind, Settings, SnippetSortOrder};
 
 pub const MENU_GAP: Pixels = px(4.);
 pub const MENU_ASIDE_X_PADDING: Pixels = px(16.);
 pub const MENU_ASIDE_MIN_WIDTH: Pixels = px(260.);
+
+const COMPLETION_RECENCY_CAP: usize = 200;
+const COMPLETION_RECENCY_KEY: &str = "completion_recency";
+/// Half-window (in chars) around the cursor scanned for the locality bonus.
+const COMPLETION_LOCALITY_WINDOW: usize = 10_000;
+/// Max score multiplier from the locality bonus (for a same-line identifier).
+const COMPLETION_LOCALITY_WEIGHT: f64 = 0.3;
+
+/// Memory of accepted completions keyed by their filter text, used to pre-select
+/// the most recently accepted matching entry when the completion menu reopens
+/// (matching VS Code's `editor.suggestSelection: recentlyUsed`). Persisted in
+/// the global key-value store so it survives restarts.
+#[derive(Default)]
+struct CompletionRecencyInner {
+    /// filter text -> monotonically increasing "touch" (higher == more recent).
+    touches: HashMap<String, u64>,
+    counter: u64,
+    loaded: bool,
+}
+
+#[derive(Clone, Default)]
+struct CompletionRecency(Arc<Mutex<CompletionRecencyInner>>);
+impl Global for CompletionRecency {}
+
+impl CompletionRecency {
+    /// Loads the persisted map the first time it's needed (one small KV read).
+    fn ensure_loaded(&self) {
+        let mut inner = self.0.lock().unwrap();
+        if inner.loaded {
+            return;
+        }
+        inner.loaded = true;
+        if let Ok(Some(value)) = GlobalKeyValueStore::global().read_kvp(COMPLETION_RECENCY_KEY)
+            && let Ok(touches) = serde_json::from_str::<HashMap<String, u64>>(&value)
+        {
+            inner.counter = touches.values().copied().max().unwrap_or(0);
+            inner.touches = touches;
+        }
+    }
+}
+
+fn completion_recency(cx: &mut App) -> CompletionRecency {
+    cx.default_global::<CompletionRecency>().clone()
+}
+
+/// Records that a completion with `filter_text` was just accepted, so it can be
+/// pre-selected the next time it appears among the candidates, and persists the
+/// updated map in the background.
+pub(crate) fn note_completion_accepted(filter_text: &str, cx: &mut App) {
+    if filter_text.is_empty() {
+        return;
+    }
+    let recency = completion_recency(cx);
+    recency.ensure_loaded();
+    let serialized = {
+        let mut inner = recency.0.lock().unwrap();
+        inner.counter += 1;
+        let counter = inner.counter;
+        inner.touches.insert(filter_text.to_string(), counter);
+        if inner.touches.len() > COMPLETION_RECENCY_CAP
+            && let Some(oldest) = inner
+                .touches
+                .iter()
+                .min_by_key(|(_, touch)| **touch)
+                .map(|(key, _)| key.clone())
+        {
+            inner.touches.remove(&oldest);
+        }
+        serde_json::to_string(&inner.touches).ok()
+    };
+    if let Some(serialized) = serialized {
+        cx.background_executor()
+            .spawn(async move {
+                GlobalKeyValueStore::global()
+                    .write_kvp(COMPLETION_RECENCY_KEY.to_string(), serialized)
+                    .await
+                    .log_err();
+            })
+            .detach();
+    }
+}
+
+/// Maps identifiers appearing within a window around the cursor to their line
+/// distance from it, used to apply the locality bonus to completion scores.
+fn compute_completion_locality(
+    snapshot: &BufferSnapshot,
+    cursor: text::Anchor,
+) -> HashMap<String, u32> {
+    use text::{ToOffset as _, ToPoint as _};
+    let cursor_offset = cursor.to_offset(snapshot);
+    let cursor_row = cursor.to_point(snapshot).row;
+    let start = cursor_offset.saturating_sub(COMPLETION_LOCALITY_WINDOW);
+    let end = (cursor_offset + COMPLETION_LOCALITY_WINDOW).min(snapshot.len());
+    let mut locality = HashMap::default();
+    for (word, range) in snapshot.words_in_range(WordsQuery {
+        fuzzy_contents: None,
+        skip_digits: true,
+        range: start..end,
+    }) {
+        let row = range.start.to_point(snapshot).row;
+        locality.insert(word, row.abs_diff(cursor_row));
+    }
+    locality
+}
 pub const MENU_ASIDE_MAX_WIDTH: Pixels = px(500.);
 pub const COMPLETION_MENU_MIN_WIDTH: Pixels = px(280.);
 pub const COMPLETION_MENU_MAX_WIDTH: Pixels = px(540.);
@@ -929,7 +1034,7 @@ impl CompletionsMenu {
         let list = uniform_list(
             "completions",
             self.entries.borrow().len(),
-            cx.processor(move |_editor, range: Range<usize>, _window, cx| {
+            cx.processor(move |_editor, range: Range<usize>, window, cx| {
                 last_rendered_range.borrow_mut().replace(range.clone());
                 let start_ix = range.start;
                 let completions_guard = completions.borrow_mut();
@@ -1041,9 +1146,13 @@ impl CompletionsMenu {
                             })
                             .collect();
                         let suffix_label = if !suffix_text.is_empty() {
+                            // Render the trailing detail (import module / path) in a
+                            // muted color, matching VS Code / Cursor's dimmed source text.
+                            let mut suffix_style = style.text.clone();
+                            suffix_style.color = cx.theme().colors().text_muted;
                             Some(
                                 StyledText::new(suffix_text)
-                                    .with_default_highlights(&style.text, suffix_highlights),
+                                    .with_default_highlights(&suffix_style, suffix_highlights),
                             )
                         } else {
                             None
@@ -1100,24 +1209,24 @@ impl CompletionsMenu {
                                 })
                             });
 
-                        let kind_letter_slot = match completion_menu_item_kind {
+                        let kind_icon_slot = match completion_menu_item_kind {
                             CompletionMenuItemKind::Off => None,
-                            CompletionMenuItemKind::Symbol => Some(render_completion_kind_letter(
+                            CompletionMenuItemKind::Symbol => Some(render_completion_kind_icon(
                                 completion.kind(),
                                 item_ix,
                                 &style,
                             )),
                         };
 
-                        let start_slot = match (kind_letter_slot, icon_or_color_slot) {
-                            (Some(letter), Some(icon_or_color)) => Some(
+                        let start_slot = match (kind_icon_slot, icon_or_color_slot) {
+                            (Some(icon), Some(icon_or_color)) => Some(
                                 h_flex()
                                     .gap_0p5()
-                                    .child(letter)
+                                    .child(icon)
                                     .child(icon_or_color)
                                     .into_any_element(),
                             ),
-                            (Some(letter), None) => Some(letter),
+                            (Some(icon), None) => Some(icon),
                             (None, slot) => slot,
                         };
 
@@ -1127,6 +1236,9 @@ impl CompletionsMenu {
                             .child(
                                 ListItem::new(mat.candidate_id)
                                     .inset(true)
+                                    // Match Cursor/VS Code's slightly roomier suggest rows
+                                    // (~4px taller than the bare line height).
+                                    .height(window.line_height() + px(4.))
                                     .toggle_state(item_ix == selected_item)
                                     .on_click(cx.listener(move |editor, _event, window, cx| {
                                         cx.stop_propagation();
@@ -1331,6 +1443,7 @@ impl CompletionsMenu {
         let match_candidates = self.match_candidates.clone();
         let cancel_filter = self.cancel_filter.clone();
         let default_query = query.clone();
+        let locality_enabled = EditorSettings::get_global(cx).completion_locality;
 
         let matches_task = cx.background_spawn(async move {
             let queries_and_candidates = match_candidates
@@ -1361,14 +1474,31 @@ impl CompletionsMenu {
                     .await,
                 );
             }
-            results
+
+            let locality = if locality_enabled {
+                compute_completion_locality(&buffer_snapshot, query_end)
+            } else {
+                HashMap::default()
+            };
+            (results, locality)
         });
 
         let completions = self.completions.clone();
         let sort_completions = self.sort_completions;
         let snippet_sort_order = self.snippet_sort_order;
         cx.foreground_executor().spawn(async move {
-            let mut matches = matches_task.await;
+            let (mut matches, locality) = matches_task.await;
+
+            // Nudge scores so identifiers near the cursor rank higher (locality
+            // bonus), then sort. Modest so it only refines near-ties.
+            if !locality.is_empty() {
+                for string_match in &mut matches {
+                    if let Some(&distance) = locality.get(&string_match.string) {
+                        let bonus = COMPLETION_LOCALITY_WEIGHT / (1.0 + distance as f64);
+                        string_match.score *= 1.0 + bonus;
+                    }
+                }
+            }
 
             let completions_ref = completions.borrow();
 
@@ -1422,8 +1552,41 @@ impl CompletionsMenu {
         }
         drop(completions);
         *self.entries.borrow_mut() = entries.into_boxed_slice();
-        self.selected_item = self.find_selectable_entry(0, true).unwrap_or(0);
+        self.selected_item = self
+            .recency_preselect(cx)
+            .or_else(|| self.find_selectable_entry(0, true))
+            .unwrap_or(0);
         self.handle_selection_changed(provider.as_deref(), window, cx);
+    }
+
+    /// Returns the entry index of the most recently accepted matching completion,
+    /// so it can be pre-selected (à la VS Code's `suggestSelection: recentlyUsed`).
+    /// `None` when the feature is off or no candidate has been used before.
+    fn recency_preselect(&self, cx: &mut Context<Editor>) -> Option<usize> {
+        if !EditorSettings::get_global(cx).completion_recency {
+            return None;
+        }
+        let recency = completion_recency(cx);
+        recency.ensure_loaded();
+        let touches = recency.0.lock().unwrap();
+        if touches.touches.is_empty() {
+            return None;
+        }
+        let completions = self.completions.borrow();
+        let entries = self.entries.borrow();
+        let mut best: Option<(usize, u64)> = None;
+        for (ix, entry) in entries.iter().enumerate() {
+            let Some(mat) = entry.as_match() else {
+                continue;
+            };
+            let filter_text = completions[mat.candidate_id].label.filter_text();
+            if let Some(&touch) = touches.touches.get(filter_text)
+                && best.is_none_or(|(_, best_touch)| touch > best_touch)
+            {
+                best = Some((ix, touch));
+            }
+        }
+        best.map(|(ix, _)| ix)
     }
 
     pub fn sort_string_matches(
@@ -1570,25 +1733,20 @@ impl CompletionsMenu {
     }
 }
 
-fn render_completion_kind_letter(
+fn render_completion_kind_icon(
     kind: Option<CompletionItemKind>,
     item_ix: usize,
     style: &EditorStyle,
 ) -> AnyElement {
-    let badge = div()
-        .flex_none()
-        .w(IconSize::XSmall.rems())
-        .text_center()
-        .text_size(rems_from_px(11.))
-        .line_height(rems_from_px(14.));
-
     let Some(kind) = kind else {
-        return badge.into_any_element();
-    };
-    let Some(letter) = completion_kind_letter(kind) else {
-        return badge.into_any_element();
+        return div()
+            .flex_none()
+            .w(IconSize::Small.rems())
+            .into_any_element();
     };
 
+    // Tint the kind icon with the same syntax color used for that kind's text,
+    // mirroring VS Code / Cursor, which color their completion icons by kind.
     let color = completion_kind_highlight_name(kind)
         .and_then(|name| {
             style.syntax.style_for_name(name).or_else(|| {
@@ -1598,12 +1756,46 @@ fn render_completion_kind_letter(
         })
         .and_then(|hl| hl.color);
 
-    badge
+    div()
         .id(("completion-kind", item_ix))
+        .flex_none()
         .tooltip(Tooltip::text(completion_kind_name(kind)))
-        .child(letter)
-        .when_some(color, |element, color| element.text_color(color))
+        .child(
+            Icon::from_path(completion_kind_icon(kind))
+                .size(IconSize::Small)
+                .color(color.map_or(Color::Muted, Color::Custom)),
+        )
         .into_any_element()
+}
+
+/// Maps an LSP completion kind to a bundled codicon (the same icon set VS Code
+/// and Cursor render in their suggest widget).
+fn completion_kind_icon(kind: CompletionItemKind) -> &'static str {
+    match kind {
+        CompletionItemKind::METHOD
+        | CompletionItemKind::FUNCTION
+        | CompletionItemKind::CONSTRUCTOR => "icons/symbol_method.svg",
+        CompletionItemKind::FIELD => "icons/symbol_field.svg",
+        CompletionItemKind::VARIABLE => "icons/symbol_variable.svg",
+        CompletionItemKind::CLASS => "icons/symbol_class.svg",
+        CompletionItemKind::STRUCT => "icons/symbol_structure.svg",
+        CompletionItemKind::INTERFACE => "icons/symbol_interface.svg",
+        CompletionItemKind::MODULE => "icons/symbol_namespace.svg",
+        CompletionItemKind::PROPERTY => "icons/symbol_property.svg",
+        CompletionItemKind::EVENT => "icons/symbol_event.svg",
+        CompletionItemKind::OPERATOR => "icons/symbol_operator.svg",
+        CompletionItemKind::UNIT => "icons/symbol_ruler.svg",
+        CompletionItemKind::VALUE | CompletionItemKind::ENUM => "icons/symbol_enum.svg",
+        CompletionItemKind::CONSTANT => "icons/symbol_constant.svg",
+        CompletionItemKind::ENUM_MEMBER => "icons/symbol_enum_member.svg",
+        CompletionItemKind::KEYWORD => "icons/symbol_keyword.svg",
+        CompletionItemKind::TEXT => "icons/symbol_key.svg",
+        CompletionItemKind::COLOR => "icons/symbol_color.svg",
+        CompletionItemKind::FILE | CompletionItemKind::FOLDER => "icons/symbol_file.svg",
+        CompletionItemKind::TYPE_PARAMETER => "icons/symbol_parameter.svg",
+        CompletionItemKind::SNIPPET => "icons/symbol_snippet.svg",
+        _ => "icons/symbol_misc.svg",
+    }
 }
 
 fn completion_kind_name(kind: CompletionItemKind) -> &'static str {
@@ -1635,37 +1827,6 @@ fn completion_kind_name(kind: CompletionItemKind) -> &'static str {
         CompletionItemKind::TYPE_PARAMETER => "Type Parameter",
         _ => "Unknown",
     }
-}
-
-fn completion_kind_letter(kind: CompletionItemKind) -> Option<&'static str> {
-    Some(match kind {
-        CompletionItemKind::TEXT => "t",
-        CompletionItemKind::METHOD => "m",
-        CompletionItemKind::FUNCTION => "f",
-        CompletionItemKind::CONSTRUCTOR => "C",
-        CompletionItemKind::FIELD => "f",
-        CompletionItemKind::VARIABLE => "v",
-        CompletionItemKind::CLASS => "c",
-        CompletionItemKind::INTERFACE => "i",
-        CompletionItemKind::MODULE => "M",
-        CompletionItemKind::PROPERTY => "p",
-        CompletionItemKind::UNIT => "u",
-        CompletionItemKind::VALUE => "v",
-        CompletionItemKind::ENUM => "e",
-        CompletionItemKind::KEYWORD => "k",
-        CompletionItemKind::SNIPPET => "s",
-        CompletionItemKind::COLOR => "c",
-        CompletionItemKind::FILE => "F",
-        CompletionItemKind::REFERENCE => "r",
-        CompletionItemKind::FOLDER => "D",
-        CompletionItemKind::ENUM_MEMBER => "e",
-        CompletionItemKind::CONSTANT => "c",
-        CompletionItemKind::STRUCT => "S",
-        CompletionItemKind::EVENT => "E",
-        CompletionItemKind::OPERATOR => "o",
-        CompletionItemKind::TYPE_PARAMETER => "T",
-        _ => return None,
-    })
 }
 
 fn completion_kind_highlight_name(kind: CompletionItemKind) -> Option<&'static str> {

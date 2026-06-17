@@ -104,6 +104,12 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: terminal_controlled
     pub blinking: Option<TerminalBlink>,
+    /// Whether the cursor glides smoothly to its new position while typing at the
+    /// prompt, instead of jumping (matching Microsoft Word / Cursor). Output,
+    /// full-screen apps (vim, htop), and large jumps still move instantly.
+    ///
+    /// Default: false
+    pub smooth_caret: Option<bool>,
     /// Sets whether Alternate Scroll mode (code: ?1007) is active by default.
     /// Alternate Scroll mode converts mouse scroll events into up / down key
     /// presses when in the alternate screen (e.g. when running applications

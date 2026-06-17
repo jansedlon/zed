@@ -765,43 +765,6 @@ impl LspAdapter for TypeScriptLspAdapter {
         ])
     }
 
-    async fn label_for_completion(
-        &self,
-        item: &lsp::CompletionItem,
-        language: &Arc<language::Language>,
-    ) -> Option<language::CodeLabel> {
-        use lsp::CompletionItemKind as Kind;
-        let label_len = item.label.len();
-        let grammar = language.grammar()?;
-        let highlight_id = match item.kind? {
-            Kind::CLASS | Kind::INTERFACE | Kind::ENUM => grammar.highlight_id_for_name("type"),
-            Kind::CONSTRUCTOR => grammar.highlight_id_for_name("type"),
-            Kind::CONSTANT => grammar.highlight_id_for_name("constant"),
-            Kind::FUNCTION | Kind::METHOD => grammar.highlight_id_for_name("function"),
-            Kind::PROPERTY | Kind::FIELD => grammar.highlight_id_for_name("property"),
-            Kind::VARIABLE => grammar.highlight_id_for_name("variable"),
-            _ => None,
-        }?;
-
-        let text = if let Some(description) = item
-            .label_details
-            .as_ref()
-            .and_then(|label_details| label_details.description.as_ref())
-        {
-            format!("{} {}", item.label, description)
-        } else if let Some(detail) = &item.detail {
-            format!("{} {}", item.label, detail)
-        } else {
-            item.label.clone()
-        };
-        Some(language::CodeLabel::filtered(
-            text,
-            label_len,
-            item.filter_text.as_deref(),
-            vec![(0..label_len, highlight_id)],
-        ))
-    }
-
     async fn initialization_options(
         self: Arc<Self>,
         adapter: &Arc<dyn LspAdapterDelegate>,

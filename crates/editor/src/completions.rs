@@ -795,6 +795,11 @@ impl Editor {
             .clone();
         cx.stop_propagation();
 
+        // Remember this acceptance so it can be pre-selected next time (recency).
+        if EditorSettings::get_global(cx).completion_recency {
+            crate::code_context_menus::note_completion_accepted(completion.label.filter_text(), cx);
+        }
+
         let buffer_handle = completions_menu.buffer.clone();
         let multibuffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let (initial_position, _) =

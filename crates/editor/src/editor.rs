@@ -17,6 +17,7 @@ mod bracket_colorization;
 mod clangd_ext;
 pub mod code_context_menus;
 mod code_lens;
+mod version_lens;
 pub mod display_map;
 mod document_colors;
 mod document_links;
@@ -139,6 +140,7 @@ use code_context_menus::{
     CompletionsMenu, ContextMenuOrigin,
 };
 use code_lens::CodeLensState;
+use version_lens::VersionLensState;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
 use dap::TelemetrySpawnLocation;
@@ -918,6 +920,78 @@ struct ActionFetchReady {
     actions: Rc<[AvailableCodeAction]>,
 }
 
+/// Tracks the primary caret's glide (in scroll-independent document pixels) so it
+/// can smoothly animate to new positions when smooth caret animation is on.
+///
+/// This is an absolute-time tween (`from` -> `to` over a fixed duration) rather
+/// than a per-frame delta, so it stays continuous and framerate-independent even
+/// after the editor has been idle (no stale "time since last frame").
+pub(crate) struct SmoothCaretState {
+    pub from: gpui::Point<Pixels>,
+    pub to: gpui::Point<Pixels>,
+    pub start: Instant,
+}
+
+impl SmoothCaretState {
+    /// The eased caret position along the current glide at `now`.
+    pub fn position(&self, now: Instant, duration: f32) -> gpui::Point<Pixels> {
+        let t = ((now - self.start).as_secs_f32() / duration).clamp(0., 1.);
+        // Cubic ease-out: quick start, gentle stop (matches VS Code / Cursor).
+        let eased = 1. - (1. - t).powi(3);
+        gpui::point(
+            self.from.x + (self.to.x - self.from.x) * eased,
+            self.from.y + (self.to.y - self.from.y) * eased,
+        )
+    }
+
+    pub fn is_finished(&self, now: Instant, duration: f32) -> bool {
+        (now - self.start).as_secs_f32() >= duration
+    }
+}
+
+/// How long the cursor takes to fade in/out per blink when smooth blink is on.
+const SMOOTH_BLINK_DURATION: f32 = 0.18;
+
+/// Tween of the cursor's blink opacity (0..1) toward the blink manager's on/off
+/// target, so the cursor fades smoothly instead of toggling abruptly.
+pub(crate) struct SmoothBlinkState {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+impl SmoothBlinkState {
+    fn opacity(&self, now: Instant) -> f32 {
+        let t = ((now - self.start).as_secs_f32() / SMOOTH_BLINK_DURATION).clamp(0., 1.);
+        // Smoothstep: gentle at both ends.
+        let eased = t * t * (3. - 2. * t);
+        self.from + (self.to - self.from) * eased
+    }
+
+    fn is_finished(&self, now: Instant) -> bool {
+        (now - self.start).as_secs_f32() >= SMOOTH_BLINK_DURATION
+    }
+}
+
+/// How long a newly inserted character takes to fade in when smooth typing is on.
+const SMOOTH_TYPING_DURATION: Duration = Duration::from_millis(120);
+/// How often the fade is advanced while typed text is fading in.
+const SMOOTH_TYPING_TICK: Duration = Duration::from_millis(8);
+/// Number of opacity levels the fade is quantized into (one text-highlight key
+/// each), since a highlight applies a single style to all its ranges.
+const SMOOTH_TYPING_BUCKETS: usize = 10;
+/// Inserts longer than this (e.g. a large paste) are not faded.
+const SMOOTH_TYPING_MAX_INSERT_LEN: usize = 2000;
+
+/// State for the smooth-typing fade-in of newly inserted text: the multibuffer
+/// edit subscription used to detect insertions, the recently inserted ranges with
+/// the time they were inserted, and an epoch so superseded fade tickers stop.
+pub(crate) struct SmoothTypingState {
+    subscription: text::Subscription<multi_buffer::MultiBufferOffset>,
+    inserts: Vec<(Range<Anchor>, Instant)>,
+    epoch: usize,
+}
+
 /// Zed's primary implementation of text input, allowing users to edit a [`MultiBuffer`].
 ///
 /// See the [module level documentation](self) for more information.
@@ -1062,6 +1136,16 @@ pub struct Editor {
     next_color_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
+    /// Animated (document-space) position of the primary caret, used to glide it
+    /// to new positions when `cursor_smooth_caret_animation` is enabled.
+    smooth_caret: Option<SmoothCaretState>,
+    /// Animated (document-space) position of the newest selection's moving edge,
+    /// used to glide the selection highlight when `cursor_smooth_selection` is on.
+    smooth_selection: Option<SmoothCaretState>,
+    /// Fade-in animation state for newly inserted text when `smooth_typing` is on.
+    smooth_typing: Option<SmoothTypingState>,
+    /// Blink-opacity tween for the cursor when `cursor_smooth_blink` is on.
+    smooth_blink: Option<SmoothBlinkState>,
     gutter_dimensions: GutterDimensions,
     style: Option<EditorStyle>,
     text_style_refinement: Option<TextStyleRefinement>,
@@ -1151,6 +1235,7 @@ pub struct Editor {
     selection_drag_state: SelectionDragState,
     colors: Option<LspColorData>,
     code_lens: Option<CodeLensState>,
+    version_lens: Option<VersionLensState>,
     post_scroll_update: Task<()>,
     refresh_colors_task: Task<()>,
     refresh_code_lens_task: Task<()>,
@@ -2274,6 +2359,10 @@ impl Editor {
             inline_value_cache: InlineValueCache::new(inlay_hint_settings.show_value_hints),
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
+            smooth_caret: None,
+            smooth_selection: None,
+            smooth_typing: None,
+            smooth_blink: None,
             last_bounds: None,
             last_position_map: None,
             last_right_margin: Pixels::ZERO,
@@ -2345,6 +2434,7 @@ impl Editor {
             pull_diagnostics_task: Task::ready(()),
             colors: None,
             code_lens: None,
+            version_lens: None,
             refresh_colors_task: Task::ready(()),
             refresh_code_lens_task: Task::ready(()),
             use_document_folding_ranges: false,
@@ -9342,6 +9432,126 @@ impl Editor {
         });
     }
 
+    /// Records the ranges inserted by an edit and (re)starts the smooth-typing
+    /// fade-in for them. Only local insertions are faded.
+    fn note_smooth_typing_edit(
+        &mut self,
+        source: language::BufferEditSource,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).smooth_typing {
+            if self.smooth_typing.take().is_some() {
+                for bucket in 0..SMOOTH_TYPING_BUCKETS {
+                    self.clear_highlights(HighlightKey::SmoothTypingFade(bucket), cx);
+                }
+            }
+            return;
+        }
+
+        if self.smooth_typing.is_none() {
+            let subscription = self.buffer.update(cx, |buffer, _| buffer.subscribe());
+            self.smooth_typing = Some(SmoothTypingState {
+                subscription,
+                inserts: Vec::new(),
+                epoch: 0,
+            });
+        }
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let now = Instant::now();
+        let epoch = {
+            let Some(state) = self.smooth_typing.as_mut() else {
+                return;
+            };
+            // Always drain the subscription so it doesn't accumulate, but only
+            // fade in local insertions (not collaborators' edits).
+            let edits = state.subscription.consume().into_inner();
+            if source.is_local() {
+                for edit in edits {
+                    let (start, end) = (edit.new.start, edit.new.end);
+                    if end.0 <= start.0 || end.0 - start.0 > SMOOTH_TYPING_MAX_INSERT_LEN {
+                        continue;
+                    }
+                    let range = snapshot.anchor_before(start)..snapshot.anchor_after(end);
+                    state.inserts.push((range, now));
+                }
+            }
+            if state.inserts.is_empty() {
+                return;
+            }
+            state.epoch += 1;
+            state.epoch
+        };
+        self.animate_smooth_typing(epoch, cx);
+    }
+
+    /// Advances the smooth-typing fade by re-applying per-opacity-bucket text
+    /// highlights, rescheduling itself until all inserted text is fully visible.
+    fn animate_smooth_typing(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        let enabled = EditorSettings::get_global(cx).smooth_typing;
+        let now = Instant::now();
+
+        let mut bucket_ranges: Vec<Vec<Range<Anchor>>> = vec![Vec::new(); SMOOTH_TYPING_BUCKETS];
+        let mut active = false;
+        match self.smooth_typing.as_mut() {
+            Some(state) if epoch == state.epoch => {
+                if enabled {
+                    state
+                        .inserts
+                        .retain(|(_, at)| now.duration_since(*at) < SMOOTH_TYPING_DURATION);
+                    for (range, at) in &state.inserts {
+                        let progress = (now.duration_since(*at).as_secs_f32()
+                            / SMOOTH_TYPING_DURATION.as_secs_f32())
+                        .clamp(0.0, 1.0);
+                        // Ease-out: characters become legible quickly, then settle.
+                        let opacity = 1.0 - (1.0 - progress).powi(2);
+                        let bucket = (opacity * (SMOOTH_TYPING_BUCKETS - 1) as f32).round() as usize;
+                        bucket_ranges[bucket.min(SMOOTH_TYPING_BUCKETS - 1)].push(range.clone());
+                    }
+                    active = !state.inserts.is_empty();
+                }
+            }
+            // A newer edit started its own ticker, or the state is gone: stop.
+            _ => return,
+        }
+
+        if !active {
+            for bucket in 0..SMOOTH_TYPING_BUCKETS {
+                self.clear_highlights(HighlightKey::SmoothTypingFade(bucket), cx);
+            }
+            if !enabled {
+                self.smooth_typing = None;
+            } else if let Some(state) = self.smooth_typing.as_mut() {
+                state.inserts.clear();
+            }
+            return;
+        }
+
+        for (bucket, ranges) in bucket_ranges.into_iter().enumerate() {
+            if ranges.is_empty() {
+                self.clear_highlights(HighlightKey::SmoothTypingFade(bucket), cx);
+            } else {
+                let opacity = bucket as f32 / (SMOOTH_TYPING_BUCKETS - 1) as f32;
+                self.highlight_text(
+                    HighlightKey::SmoothTypingFade(bucket),
+                    ranges,
+                    HighlightStyle {
+                        fade_out: Some(1.0 - opacity),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SMOOTH_TYPING_TICK).await;
+            this.update(cx, |this, cx| this.animate_smooth_typing(epoch, cx))
+                .ok();
+        })
+        .detach();
+    }
+
     fn on_buffer_event(
         &mut self,
         multibuffer: &Entity<MultiBuffer>,
@@ -9366,6 +9576,8 @@ impl Editor {
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
+
+                self.note_smooth_typing_edit(*source, cx);
 
                 // Clean up orphaned review comments after edits
                 self.cleanup_orphaned_review_comments(cx);
@@ -9474,6 +9686,7 @@ impl Editor {
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                self.schedule_version_lens_refresh(cx);
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
